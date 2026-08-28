@@ -298,6 +298,7 @@ class Database:
                 parse_mode TEXT NOT NULL DEFAULT 'HTML',
                 source_chat_id INTEGER,
                 source_message_id INTEGER,
+                entities_json TEXT NOT NULL DEFAULT '[]',
                 buttons_json TEXT NOT NULL DEFAULT '[]',
                 status TEXT NOT NULL DEFAULT 'pending',
                 total INTEGER NOT NULL DEFAULT 0,
@@ -377,9 +378,12 @@ class Database:
         except sqlite3.OperationalError:
             pass  # Column already exists
 
-        # Add source_chat_id / source_message_id to broadcasts if upgrading
-        for col in ("source_chat_id INTEGER", "source_message_id INTEGER"):
-            col_name = col.split()[0]
+        # Add source fields / entity storage to broadcasts when upgrading
+        for col in (
+            "source_chat_id INTEGER",
+            "source_message_id INTEGER",
+            "entities_json TEXT NOT NULL DEFAULT '[]'",
+        ):
             try:
                 self.conn.execute(f"ALTER TABLE broadcasts ADD COLUMN {col}")
                 self.conn.commit()
@@ -1186,10 +1190,13 @@ async def send_configured_message(bot, chat_id: int, user=None):
 
     for attempt in range(MAX_RETRIES):
         try:
-            # When there is no per-user template, copy_message remains the best
-            # fallback because Telegram preserves every original entity exactly.
-            # With a template, send the stored entities after substitution.
-            if source_chat and source_msg and not has_template and not stored_entities:
+            # IMPORTANT: when there is no per-user template, always prefer the
+            # original Telegram message. copy_message preserves Telegram-side
+            # entities verbatim, including custom/premium emoji, formatting,
+            # spoilers and links. The previous build skipped this path whenever
+            # stored_entities was non-empty, which caused the preview to be
+            # reconstructed and made custom emoji unreliable.
+            if source_chat and source_msg and not has_template:
                 try:
                     return await bot.copy_message(
                         chat_id=chat_id,
@@ -1197,9 +1204,13 @@ async def send_configured_message(bot, chat_id: int, user=None):
                         message_id=source_msg,
                         reply_markup=keyboard,
                     )
-                except TelegramError:
-                    db.set_setting("join_msg_source_chat", "0")
-                    db.set_setting("join_msg_source_id", "0")
+                except TelegramError as copy_exc:
+                    logger.warning(
+                        "copy_message failed for configured message; using entity fallback: %s",
+                        clean_error(copy_exc)[:500],
+                    )
+                    # Keep the source IDs so a transient Telegram error does not
+                    # permanently disable the exact-copy path.
 
             if media_type == "photo" and file_id:
                 kwargs = {
@@ -2578,26 +2589,34 @@ async def create_broadcast(
         media_type = "photo"
         file_id = message.photo[-1].file_id
         caption = message.caption or ""
+        source_entities = message.caption_entities or ()
+        max_len = 1024
     else:
         text = message.text or ""
         caption = text
+        source_entities = message.entities or ()
+        max_len = MAX_TEXT_LENGTH
 
     if not text and not caption:
         await message.reply_text("Broadcast content cannot be empty.")
         return
 
-    if len(text or caption) > MAX_TEXT_LENGTH:
-        await message.reply_text("Broadcast text is too long.")
+    if len(text or caption) > max_len:
+        await message.reply_text(
+            f"Broadcast content is too long. Maximum: {max_len} characters."
+        )
         return
+
+    entities_json = serialize_message_entities(source_entities)
 
     cursor = db.execute(
         """
         INSERT INTO broadcasts(
             admin_id,text,media_type,file_id,caption,
-            parse_mode,source_chat_id,source_message_id,
+            parse_mode,source_chat_id,source_message_id,entities_json,
             buttons_json,status,created_at
         )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             user.id,
@@ -2608,6 +2627,7 @@ async def create_broadcast(
             db.get_join_message()["parse_mode"] or "HTML",
             source_chat_id,
             source_message_id,
+            entities_json,
             "[]",
             "pending",
             utc_now(),
@@ -2670,43 +2690,62 @@ async def broadcast_confirm(
 
 
 async def send_broadcast_to_user(bot, row, user_id: int):
-    """
-    Send a broadcast message preserving premium emoji via copy_message.
-    Falls back to send_photo / send_message when copy fails.
+    """Send a broadcast while preserving Telegram message entities.
+
+    Exact-copy is the primary path because Telegram itself carries custom/premium
+    emoji as MessageEntity.CUSTOM_EMOJI. A stored-entity fallback is kept for
+    cases where copy_message is temporarily unavailable.
     """
     source_chat = safe_int(row["source_chat_id"] if "source_chat_id" in row.keys() else 0, 0)
     source_msg = safe_int(row["source_message_id"] if "source_message_id" in row.keys() else 0, 0)
+    buttons = parse_json(row["buttons_json"], [])
+    keyboard = build_keyboard(buttons)
 
-    # Prefer copy_message — it preserves all entities including premium emoji
+    # Best path: exact Telegram-side copy. This preserves custom/premium emoji
+    # without reparsing or re-encoding the message.
     if source_chat and source_msg:
         try:
             return await bot.copy_message(
                 chat_id=user_id,
                 from_chat_id=source_chat,
                 message_id=source_msg,
+                reply_markup=keyboard,
             )
-        except TelegramError:
-            pass  # Fall through to direct send
+        except TelegramError as copy_exc:
+            logger.warning(
+                "Broadcast copy_message fallback for user %s: %s",
+                user_id, clean_error(copy_exc)[:500],
+            )
 
-    buttons = parse_json(row["buttons_json"], [])
-    keyboard = build_keyboard(buttons)
+    entities = deserialize_message_entities(
+        row["entities_json"] if "entities_json" in row.keys() else "[]",
+        bot,
+    )
 
     if row["media_type"] == "photo" and row["file_id"]:
-        return await bot.send_photo(
-            chat_id=user_id,
-            photo=row["file_id"],
-            caption=(row["caption"] or "")[:1024] or None,
-            parse_mode=row["parse_mode"] or None,
-            reply_markup=keyboard,
-        )
+        kwargs = {
+            "chat_id": user_id,
+            "photo": row["file_id"],
+            "caption": (row["caption"] or "")[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        else:
+            kwargs["parse_mode"] = row["parse_mode"] or None
+        return await bot.send_photo(**kwargs)
 
-    return await bot.send_message(
-        chat_id=user_id,
-        text=(row["text"] or row["caption"] or " ")[:MAX_TEXT_LENGTH],
-        parse_mode=row["parse_mode"] or None,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
+    kwargs = {
+        "chat_id": user_id,
+        "text": (row["text"] or row["caption"] or " ")[:MAX_TEXT_LENGTH],
+        "reply_markup": keyboard,
+        "disable_web_page_preview": True,
+    }
+    if entities:
+        kwargs["entities"] = entities
+    else:
+        kwargs["parse_mode"] = row["parse_mode"] or None
+    return await bot.send_message(**kwargs)
 
 
 async def run_broadcast(application: Application, broadcast_id: int):
@@ -2789,6 +2828,17 @@ async def run_broadcast(application: Application, broadcast_id: int):
                     await asyncio.sleep(float(exc.retry_after) + 1)
                     await send_broadcast_to_user(application.bot, row, user_id)
                     sent += 1
+                    db.execute(
+                        """
+                        INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
+                        VALUES(?,?,?,?,?)
+                        ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
+                            status=excluded.status,error=excluded.error,
+                            created_at=excluded.created_at
+                        """,
+                        (broadcast_id, user_id, "sent", None, utc_now()),
+                        commit=True,
+                    )
                 except Forbidden as retry_exc:
                     blocked += 1
                     db.execute(
