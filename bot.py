@@ -17,6 +17,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
+    MessageEntity,
     Update,
 )
 from telegram.error import (
@@ -75,8 +76,8 @@ BROADCAST_DELAY = 0.08
 MAX_BUTTONS = 100
 MAX_TEXT_LENGTH = 4096
 
-# Valid button style values per TG Bot API 7.x
-# style= parameter on InlineKeyboardButton (premium-only, falls back gracefully)
+# Telegram button styles supported by Bot API / python-telegram-bot 22.7+
+# primary=blue, success=green, danger=red.
 BUTTON_STYLES = ("primary", "success", "danger")
 
 logging.basicConfig(
@@ -123,26 +124,9 @@ def clean_error(exc: Exception) -> str:
     return str(exc)[:4000]
 
 
-def extract_button_style_kwargs(style: Optional[str]) -> dict:
-    """
-    Returns the extra kwargs needed to pass a button color style to TG.
-    python-telegram-bot >= 21 exposes InlineKeyboardButton(type=...) for
-    Telegram Bot API 7.3+ button colors.  We pass it only when valid and
-    guard against AttributeError on older library versions.
-    """
-    if not style or style not in BUTTON_STYLES:
-        return {}
-    try:
-        # TG Bot API 7.3 introduced button styles via the `type` field
-        # (not to be confused with callback_game / pay).  python-telegram-bot
-        # maps this as the `button_type` keyword in some versions; guard both.
-        test = InlineKeyboardButton.__init__.__code__.co_varnames
-        if "button_type" in test:
-            return {"button_type": style}
-        # Newer versions may call it `type` via **kwargs passthrough
-        return {}
-    except Exception:
-        return {}
+def normalize_button_style(style: Optional[str]) -> str:
+    style = (style or "primary").strip().lower()
+    return style if style in BUTTON_STYLES else "primary"
 
 
 # ============================================================
@@ -405,6 +389,7 @@ class Database:
             "start_button_style": "primary",
             "check_join_enabled": "0",
             "bot_name": "Join Request Bot",
+            "join_msg_source_entities": "[]",
         }
 
         for key, value in defaults.items():
@@ -767,18 +752,30 @@ def is_owner(user_id: Optional[int]) -> bool:
 # KEYBOARDS
 # ============================================================
 
-def _make_inline_button(text: str, url: str, style: Optional[str] = None) -> InlineKeyboardButton:
-    """
-    Build an InlineKeyboardButton with optional TG Bot API 7.3+ color style.
-    python-telegram-bot >= 21.3 exposes this via the `web_app` path or direct
-    style kwargs depending on version.  We try the style kwarg and fall back to
-    plain URL button so older library versions keep working.
-    """
-    btn_kwargs = extract_button_style_kwargs(style)
-    try:
-        return InlineKeyboardButton(text=text[:64], url=url, **btn_kwargs)
-    except TypeError:
-        return InlineKeyboardButton(text=text[:64], url=url)
+def _make_inline_button(
+    text: str,
+    url: str,
+    style: Optional[str] = None,
+) -> InlineKeyboardButton:
+    """Create a Telegram inline URL button using the Bot API `style` field."""
+    return InlineKeyboardButton(
+        text=text[:64],
+        url=url,
+        style=normalize_button_style(style),
+    )
+
+
+def _make_callback_button(
+    text: str,
+    callback_data: str,
+    style: Optional[str] = None,
+) -> InlineKeyboardButton:
+    """Create a styled Telegram callback button."""
+    return InlineKeyboardButton(
+        text=text[:64],
+        callback_data=callback_data,
+        style=normalize_button_style(style),
+    )
 
 
 def build_keyboard(buttons):
@@ -862,10 +859,7 @@ def start_keyboard():
     if db.get_setting("check_join_enabled", "0") == "1":
         rows.append(
             [
-                InlineKeyboardButton(
-                    "I HAVE JOINED",
-                    callback_data="check_join",
-                )
+                _make_callback_button("I HAVE JOINED", "check_join", "success")
             ]
         )
 
@@ -880,70 +874,31 @@ def admin_menu():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "📊 Dashboard",
-                    callback_data="admin_dashboard",
-                ),
-                InlineKeyboardButton(
-                    "⚙️ Settings",
-                    callback_data="admin_settings",
-                ),
+                _make_callback_button("📊 Dashboard", "admin_dashboard", "primary"),
+                _make_callback_button("⚙️ Settings", "admin_settings", "primary"),
             ],
             [
-                InlineKeyboardButton(
-                    "📩 Join Request",
-                    callback_data="admin_join",
-                ),
-                InlineKeyboardButton(
-                    "💬 Message Builder",
-                    callback_data="admin_message",
-                ),
+                _make_callback_button("📩 Join Request", "admin_join", "primary"),
+                _make_callback_button("💬 Message Builder", "admin_message", "primary"),
             ],
             [
-                InlineKeyboardButton(
-                    "📢 Channels",
-                    callback_data="admin_channels",
-                ),
-                InlineKeyboardButton(
-                    "👥 Users",
-                    callback_data="admin_users",
-                ),
+                _make_callback_button("📢 Channels", "admin_channels", "primary"),
+                _make_callback_button("👥 Users", "admin_users", "primary"),
             ],
             [
-                InlineKeyboardButton(
-                    "📢 Broadcast",
-                    callback_data="admin_broadcast",
-                ),
-                InlineKeyboardButton(
-                    "📈 Statistics",
-                    callback_data="admin_stats",
-                ),
+                _make_callback_button("📢 Broadcast", "admin_broadcast", "primary"),
+                _make_callback_button("📈 Statistics", "admin_stats", "primary"),
             ],
             [
-                InlineKeyboardButton(
-                    "💾 Backup",
-                    callback_data="admin_backup",
-                ),
-                InlineKeyboardButton(
-                    "📤 Export",
-                    callback_data="admin_export",
-                ),
+                _make_callback_button("💾 Backup", "admin_backup", "primary"),
+                _make_callback_button("📤 Export", "admin_export", "primary"),
             ],
             [
-                InlineKeyboardButton(
-                    "🧪 Test Message",
-                    callback_data="admin_test",
-                ),
-                InlineKeyboardButton(
-                    "📝 Logs",
-                    callback_data="admin_logs",
-                ),
+                _make_callback_button("🧪 Test Message", "admin_test", "success"),
+                _make_callback_button("📝 Logs", "admin_logs", "danger"),
             ],
             [
-                InlineKeyboardButton(
-                    "🔐 Admins",
-                    callback_data="admin_admins",
-                )
+                _make_callback_button("🔐 Admins", "admin_admins", "primary")
             ],
         ]
     )
@@ -953,13 +908,213 @@ def back_keyboard():
     return InlineKeyboardMarkup(
         [
             [
-                InlineKeyboardButton(
-                    "⬅️ Back",
-                    callback_data="admin_home",
-                )
+                _make_callback_button("⬅️ Back", "admin_home", "primary")
             ]
         ]
     )
+
+
+# ============================================================
+# TEMPLATE + ENTITY HELPERS
+# ============================================================
+
+USERNAME_PLACEHOLDERS = (
+    "{Username}",
+    "{username}",
+    "{UserName}",
+    "{USERNAME}",
+)
+
+
+def display_name_for_user(user) -> str:
+    """Return a safe display name for per-user message templates."""
+    first_name = (getattr(user, "first_name", None) or "").strip()
+    if first_name:
+        return first_name
+
+    username = (getattr(user, "username", None) or "").strip().lstrip("@")
+    if username:
+        return f"@{username}"
+
+    return "there"
+
+
+def serialize_message_entities(entities) -> str:
+    """Serialize Telegram MessageEntity objects for persistent storage."""
+    result = []
+    for entity in entities or ():
+        data = {
+            "type": entity.type,
+            "offset": int(entity.offset),
+            "length": int(entity.length),
+        }
+
+        if entity.url:
+            data["url"] = entity.url
+        if entity.language:
+            data["language"] = entity.language
+        if entity.custom_emoji_id:
+            data["custom_emoji_id"] = entity.custom_emoji_id
+        if getattr(entity, "date_time_format", None):
+            data["date_time_format"] = entity.date_time_format
+        if getattr(entity, "user", None):
+            try:
+                data["user"] = entity.user.to_dict()
+            except Exception:
+                pass
+
+        # DATE_TIME is uncommon, but keep its unix timestamp when available.
+        unix_time = getattr(entity, "unix_time", None)
+        if unix_time is not None:
+            try:
+                data["unix_time"] = unix_time.isoformat()
+            except AttributeError:
+                pass
+
+        result.append(data)
+
+    return json.dumps(result, ensure_ascii=False)
+
+
+def deserialize_message_entities(value: str, bot=None):
+    """Restore MessageEntity objects from stored JSON."""
+    raw = parse_json(value, [])
+    if not isinstance(raw, list):
+        return []
+
+    entities = []
+    for data in raw:
+        if not isinstance(data, dict):
+            continue
+        item = dict(data)
+
+        # PTB can reconstruct nested User objects through de_json.
+        try:
+            entities.append(MessageEntity.de_json(item, bot))
+        except Exception:
+            try:
+                allowed = {
+                    key: item[key]
+                    for key in (
+                        "type",
+                        "offset",
+                        "length",
+                        "url",
+                        "language",
+                        "custom_emoji_id",
+                        "date_time_format",
+                    )
+                    if key in item
+                }
+                entities.append(MessageEntity(**allowed))
+            except Exception:
+                continue
+
+    return entities
+
+
+def _utf16_len(value: str) -> int:
+    return len(value.encode("utf-16-le")) // 2
+
+
+def render_template_with_entities(text: str, entities, user):
+    """Replace {Username} placeholders while keeping Telegram entities aligned.
+
+    Telegram entity offsets are UTF-16 code-unit offsets, so all offset changes
+    are calculated in UTF-16 rather than Python code-point positions.
+    """
+    if not text:
+        return text, list(entities or [])
+
+    replacement = display_name_for_user(user)
+    matches = []
+    for placeholder in USERNAME_PLACEHOLDERS:
+        start = 0
+        while True:
+            pos = text.find(placeholder, start)
+            if pos < 0:
+                break
+            matches.append((pos, pos + len(placeholder), replacement))
+            start = pos + len(placeholder)
+
+    if not matches:
+        return text, list(entities or [])
+
+    matches.sort(key=lambda item: item[0])
+
+    pieces = []
+    cursor = 0
+    for start, end, value in matches:
+        pieces.append(text[cursor:start])
+        pieces.append(value)
+        cursor = end
+    pieces.append(text[cursor:])
+    rendered = "".join(pieces)
+
+    # Convert Python string positions of replacements into UTF-16 positions.
+    replacements_utf16 = []
+    for start, end, value in matches:
+        replacements_utf16.append(
+            (
+                _utf16_len(text[:start]),
+                _utf16_len(text[:end]),
+                _utf16_len(value),
+            )
+        )
+
+    def map_offset(old_offset: int) -> int:
+        delta = 0
+        for old_start, old_end, new_len in replacements_utf16:
+            old_len = old_end - old_start
+            if old_offset >= old_end:
+                delta += new_len - old_len
+            elif old_offset > old_start:
+                # An entity boundary inside a placeholder is unusual. Map it
+                # to the end of the replacement so Telegram receives valid
+                # non-negative offsets.
+                return old_start + delta + new_len
+            else:
+                break
+        return old_offset + delta
+
+    shifted = []
+    for entity in entities or []:
+        old_start = int(entity.offset)
+        old_end = old_start + int(entity.length)
+        new_start = map_offset(old_start)
+        new_end = map_offset(old_end)
+
+        if new_end < new_start:
+            continue
+
+        try:
+            shifted.append(
+                MessageEntity(
+                    type=entity.type,
+                    offset=new_start,
+                    length=new_end - new_start,
+                    url=entity.url,
+                    user=entity.user,
+                    language=entity.language,
+                    custom_emoji_id=entity.custom_emoji_id,
+                    date_time_format=getattr(entity, "date_time_format", None),
+                    unix_time=getattr(entity, "unix_time", None),
+                )
+            )
+        except TypeError:
+            shifted.append(
+                MessageEntity(
+                    type=entity.type,
+                    offset=new_start,
+                    length=new_end - new_start,
+                    url=entity.url,
+                    user=entity.user,
+                    language=entity.language,
+                    custom_emoji_id=entity.custom_emoji_id,
+                )
+            )
+
+    return rendered, shifted
 
 
 # ============================================================
@@ -970,7 +1125,7 @@ def back_keyboard():
 # chat_id so we can copy_message instead of re-sending the text.
 # ============================================================
 
-async def send_configured_message(bot, chat_id: int):
+async def send_configured_message(bot, chat_id: int, user=None):
     message = db.get_join_message()
 
     if not message or not message["enabled"]:
@@ -987,7 +1142,9 @@ async def send_configured_message(bot, chat_id: int):
             {
                 "text": row["text"],
                 "url": row["url"],
-                "style": row["style"] if "style" in row.keys() else "primary",
+                "style": normalize_button_style(
+                    row["style"] if "style" in row.keys() else "primary"
+                ),
                 "row": row["row_number"],
                 "position": row["position"],
             }
@@ -995,15 +1152,30 @@ async def send_configured_message(bot, chat_id: int):
 
     keyboard = build_keyboard(buttons)
 
-    # Check if we have a stored source message for copy_message
-    # (set when admin sends the caption via conversation)
+    # If an admin supplied a message containing custom/premium emoji, store
+    # Telegram's original entities and reuse them directly. This avoids losing
+    # custom emoji while still allowing {Username} to be personalized.
+    stored_entities = deserialize_message_entities(
+        db.get_setting("join_msg_source_entities", "[]"),
+        bot,
+    )
+
+    rendered_caption, rendered_entities = render_template_with_entities(
+        caption,
+        stored_entities,
+        user,
+    )
+
+    has_template = any(token in caption for token in USERNAME_PLACEHOLDERS)
     source_chat = safe_int(db.get_setting("join_msg_source_chat", "0"), 0)
     source_msg = safe_int(db.get_setting("join_msg_source_id", "0"), 0)
 
     for attempt in range(MAX_RETRIES):
         try:
-            # Use copy_message to preserve premium emoji entities
-            if source_chat and source_msg:
+            # When there is no per-user template, copy_message remains the best
+            # fallback because Telegram preserves every original entity exactly.
+            # With a template, send the stored entities after substitution.
+            if source_chat and source_msg and not has_template and not stored_entities:
                 try:
                     return await bot.copy_message(
                         chat_id=chat_id,
@@ -1012,37 +1184,48 @@ async def send_configured_message(bot, chat_id: int):
                         reply_markup=keyboard,
                     )
                 except TelegramError:
-                    # Source message might be deleted; fall through to normal send
                     db.set_setting("join_msg_source_chat", "0")
                     db.set_setting("join_msg_source_id", "0")
 
             if media_type == "photo" and file_id:
-                return await bot.send_photo(
-                    chat_id=chat_id,
-                    photo=file_id,
-                    caption=caption[:1024],
-                    parse_mode=parse_mode,
-                    reply_markup=keyboard,
-                )
+                kwargs = {
+                    "chat_id": chat_id,
+                    "photo": file_id,
+                    "caption": (rendered_caption or "")[:1024] or None,
+                    "reply_markup": keyboard,
+                }
+                if rendered_entities:
+                    kwargs["caption_entities"] = rendered_entities
+                else:
+                    kwargs["parse_mode"] = parse_mode
+                return await bot.send_photo(**kwargs)
 
             if media_type == "document" and file_id:
-                return await bot.send_document(
-                    chat_id=chat_id,
-                    document=file_id,
-                    caption=caption[:1024],
-                    parse_mode=parse_mode,
-                    reply_markup=keyboard,
-                )
+                kwargs = {
+                    "chat_id": chat_id,
+                    "document": file_id,
+                    "caption": (rendered_caption or "")[:1024] or None,
+                    "reply_markup": keyboard,
+                }
+                if rendered_entities:
+                    kwargs["caption_entities"] = rendered_entities
+                else:
+                    kwargs["parse_mode"] = parse_mode
+                return await bot.send_document(**kwargs)
 
-            text = caption or " "
+            text = rendered_caption or " "
+            kwargs = {
+                "chat_id": chat_id,
+                "text": text[:MAX_TEXT_LENGTH],
+                "reply_markup": keyboard,
+                "disable_web_page_preview": True,
+            }
+            if rendered_entities:
+                kwargs["entities"] = rendered_entities
+            else:
+                kwargs["parse_mode"] = parse_mode
 
-            return await bot.send_message(
-                chat_id=chat_id,
-                text=text[:MAX_TEXT_LENGTH],
-                parse_mode=parse_mode,
-                reply_markup=keyboard,
-                disable_web_page_preview=True,
-            )
+            return await bot.send_message(**kwargs)
 
         except RetryAfter as exc:
             await asyncio.sleep(float(exc.retry_after) + 1)
@@ -1161,7 +1344,7 @@ async def handle_join_request(
             return
 
         try:
-            await send_configured_message(context.bot, user.id)
+            await send_configured_message(context.bot, user.id, user)
             db.update_join_request(row_id, sent=True, status="sent")
             db.log_event("join_request_message_sent", user.id, chat.id)
 
@@ -1263,16 +1446,10 @@ async def show_dashboard(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "🔄 Refresh",
-                        callback_data="admin_dashboard",
-                    )
+                    _make_callback_button("🔄 Refresh", "admin_dashboard", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1318,36 +1495,18 @@ async def show_settings(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "Toggle Maintenance",
-                        callback_data="toggle_maintenance",
-                    )
+                    _make_callback_button("Toggle Maintenance", "toggle_maintenance", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "Toggle Check Join",
-                        callback_data="toggle_check",
-                    )
+                    _make_callback_button("Toggle Check Join", "toggle_check", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "🔵 Primary",
-                        callback_data="btn_style:primary",
-                    ),
-                    InlineKeyboardButton(
-                        "🟢 Success",
-                        callback_data="btn_style:success",
-                    ),
-                    InlineKeyboardButton(
-                        "🔴 Danger",
-                        callback_data="btn_style:danger",
-                    ),
+                    _make_callback_button("🔵 Primary", "btn_style:primary", "primary"),
+                    _make_callback_button("🟢 Success", "btn_style:success", "success"),
+                    _make_callback_button("🔴 Danger", "btn_style:danger", "danger"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1366,16 +1525,10 @@ async def show_join_settings(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "Toggle Auto Message",
-                        callback_data="toggle_auto",
-                    )
+                    _make_callback_button("Toggle Auto Message", "toggle_auto", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1410,50 +1563,23 @@ async def show_message_builder(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "📝 Caption",
-                        callback_data="set_caption",
-                    ),
-                    InlineKeyboardButton(
-                        "🔤 Parse",
-                        callback_data="toggle_parse",
-                    ),
+                    _make_callback_button("📝 Caption", "set_caption", "primary"),
+                    _make_callback_button("🔤 Parse", "toggle_parse", "primary"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "🖼 Photo",
-                        callback_data="set_photo",
-                    ),
-                    InlineKeyboardButton(
-                        "🗑 Remove Media",
-                        callback_data="remove_media",
-                    ),
+                    _make_callback_button("🖼 Photo", "set_photo", "primary"),
+                    _make_callback_button("🗑 Remove Media", "remove_media", "danger"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "➕ Add Button",
-                        callback_data="add_button",
-                    ),
-                    InlineKeyboardButton(
-                        "🗑 Clear Buttons",
-                        callback_data="clear_buttons",
-                    ),
+                    _make_callback_button("➕ Add Button", "add_button", "success"),
+                    _make_callback_button("🗑 Clear Buttons", "clear_buttons", "danger"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "👁 Preview",
-                        callback_data="preview",
-                    ),
-                    InlineKeyboardButton(
-                        "🧪 Test",
-                        callback_data="admin_test",
-                    ),
+                    _make_callback_button("👁 Preview", "preview", "primary"),
+                    _make_callback_button("🧪 Test", "admin_test", "success"),
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1483,34 +1609,30 @@ async def show_channels(query):
 
     rows = [
         [
-            InlineKeyboardButton(
-                "➕ Add Channel",
-                callback_data="add_channel",
-            )
+            _make_callback_button("➕ Add Channel", "add_channel", "success")
         ]
     ]
 
     for channel in channels:
         rows.append(
             [
-                InlineKeyboardButton(
+                _make_callback_button(
                     ("Disable " if channel["enabled"] else "Enable ")
                     + str(channel["channel_id"]),
-                    callback_data=f"channel_toggle:{channel['channel_id']}",
+                    f"channel_toggle:{channel['channel_id']}",
+                    "primary",
                 ),
-                InlineKeyboardButton(
+                _make_callback_button(
                     "🗑",
-                    callback_data=f"remove_channel:{channel['channel_id']}",
+                    f"remove_channel:{channel['channel_id']}",
+                    "danger",
                 ),
             ]
         )
 
     rows.append(
         [
-            InlineKeyboardButton(
-                "⬅️ Back",
-                callback_data="admin_home",
-            )
+            _make_callback_button("⬅️ Back", "admin_home", "primary")
         ]
     )
 
@@ -1555,16 +1677,10 @@ async def show_users(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "📤 Export CSV",
-                        callback_data="export_users",
-                    )
+                    _make_callback_button("📤 Export CSV", "export_users", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1582,16 +1698,10 @@ async def show_broadcast_menu(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "➕ New Broadcast",
-                        callback_data="broadcast_start",
-                    )
+                    _make_callback_button("➕ New Broadcast", "broadcast_start", "success")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1629,16 +1739,10 @@ async def show_backup_menu(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "💾 Create Backup",
-                        callback_data="backup_create",
-                    )
+                    _make_callback_button("💾 Create Backup", "backup_create", "success")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1651,28 +1755,16 @@ async def show_export_menu(query):
         reply_markup=InlineKeyboardMarkup(
             [
                 [
-                    InlineKeyboardButton(
-                        "👥 Users CSV",
-                        callback_data="export_users",
-                    )
+                    _make_callback_button("👥 Users CSV", "export_users", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "📩 Join Requests CSV",
-                        callback_data="export_requests",
-                    )
+                    _make_callback_button("📩 Join Requests CSV", "export_requests", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "📢 Broadcast Logs CSV",
-                        callback_data="export_broadcasts",
-                    )
+                    _make_callback_button("📢 Broadcast Logs CSV", "export_broadcasts", "primary")
                 ],
                 [
-                    InlineKeyboardButton(
-                        "⬅️ Back",
-                        callback_data="admin_home",
-                    )
+                    _make_callback_button("⬅️ Back", "admin_home", "primary")
                 ],
             ]
         ),
@@ -1886,6 +1978,7 @@ async def admin_callback(
             # Clear copy_message source so we don't copy a deleted photo
             db.set_setting("join_msg_source_chat", "0")
             db.set_setting("join_msg_source_id", "0")
+            db.set_setting("join_msg_source_entities", "[]")
             await show_message_builder(query)
             return
 
@@ -2020,7 +2113,7 @@ async def preview_message(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     try:
-        await send_configured_message(context.bot, query.from_user.id)
+        await send_configured_message(context.bot, query.from_user.id, query.from_user)
         await query.message.reply_text("👁 Preview sent.")
     except Exception as exc:
         await query.message.reply_text(f"Preview failed: {clean_error(exc)[:700]}")
@@ -2031,7 +2124,7 @@ async def test_message(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     try:
-        await send_configured_message(context.bot, query.from_user.id)
+        await send_configured_message(context.bot, query.from_user.id, query.from_user)
         await query.message.reply_text("🧪 Test message sent.")
     except Exception as exc:
         await query.message.reply_text(f"Test failed: {clean_error(exc)[:700]}")
@@ -2081,18 +2174,27 @@ async def admin_input(
                 commit=True,
             )
 
-            # Store source so copy_message preserves premium emoji
+            # Store the original Telegram entities so custom/premium emoji and
+            # formatting survive while {Username} is replaced per recipient.
             db.set_setting("join_msg_source_chat", str(message.chat_id))
             db.set_setting("join_msg_source_id", str(message.message_id))
+            db.set_setting(
+                "join_msg_source_entities",
+                serialize_message_entities(message.entities or ()),
+            )
 
             context.user_data.pop("awaiting", None)
-            await message.reply_text("✅ Caption saved. Premium emoji preserved via copy_message.", reply_markup=admin_menu())
+            await message.reply_text("✅ Caption saved. Premium/custom emoji and formatting saved.", reply_markup=admin_menu())
             return
 
         # ── Photo ────────────────────────────────────────────────────────────
         if state == "photo":
             if not message.photo:
                 await message.reply_text("Please send a photo.")
+                return
+
+            if len(message.caption or "") > 1024:
+                await message.reply_text("Photo caption is too long. Telegram allows up to 1024 characters.")
                 return
 
             photo = message.photo[-1]
@@ -2113,10 +2215,15 @@ async def admin_input(
                 )
                 db.set_setting("join_msg_source_chat", str(message.chat_id))
                 db.set_setting("join_msg_source_id", str(message.message_id))
+                db.set_setting(
+                    "join_msg_source_entities",
+                    serialize_message_entities(message.caption_entities or ()),
+                )
             else:
-                # Clear stale copy source — photo changed, caption separate
+                # Clear stale source entities — this photo has no caption.
                 db.set_setting("join_msg_source_chat", "0")
                 db.set_setting("join_msg_source_id", "0")
+                db.set_setting("join_msg_source_entities", "[]")
 
             context.user_data.pop("awaiting", None)
             await message.reply_text("✅ Photo saved.", reply_markup=admin_menu())
@@ -2166,9 +2273,9 @@ async def admin_input(
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
-                            InlineKeyboardButton("🔵 Primary", callback_data="btn_add_style:primary"),
-                            InlineKeyboardButton("🟢 Success", callback_data="btn_add_style:success"),
-                            InlineKeyboardButton("🔴 Danger", callback_data="btn_add_style:danger"),
+                            _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
+                            _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
+                            _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
                         ]
                     ]
                 ),
@@ -2184,9 +2291,9 @@ async def admin_input(
                 reply_markup=InlineKeyboardMarkup(
                     [
                         [
-                            InlineKeyboardButton("🔵 Primary", callback_data="btn_add_style:primary"),
-                            InlineKeyboardButton("🟢 Success", callback_data="btn_add_style:success"),
-                            InlineKeyboardButton("🔴 Danger", callback_data="btn_add_style:danger"),
+                            _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
+                            _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
+                            _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
                         ]
                     ]
                 ),
