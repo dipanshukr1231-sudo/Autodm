@@ -71,6 +71,14 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 BACKUP_DIR = DB_PATH.parent / "backups"
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 
+RENDER_EXTERNAL_URL = os.getenv("RENDER_EXTERNAL_URL", "").strip().rstrip("/")
+try:
+    RENDER_PORT = int(os.getenv("PORT", "10000"))
+except (TypeError, ValueError):
+    RENDER_PORT = 10000
+WEBHOOK_PATH = os.getenv("WEBHOOK_PATH", f"telegram-{BOT_TOKEN.split(':', 1)[0]}").strip("/")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "").strip()
+
 MAX_RETRIES = 3
 BROADCAST_DELAY = 0.08
 MAX_BUTTONS = 100
@@ -254,6 +262,7 @@ class Database:
                 text TEXT NOT NULL,
                 url TEXT NOT NULL,
                 style TEXT NOT NULL DEFAULT 'primary',
+                icon_custom_emoji_id TEXT,
                 row_number INTEGER NOT NULL DEFAULT 0,
                 position INTEGER NOT NULL DEFAULT 0,
                 enabled INTEGER NOT NULL DEFAULT 1,
@@ -368,6 +377,15 @@ class Database:
             self.conn.commit()
         except sqlite3.OperationalError:
             pass  # Column already exists
+
+        # Add custom emoji icon support to buttons when upgrading an existing DB.
+        try:
+            self.conn.execute(
+                "ALTER TABLE message_buttons ADD COLUMN icon_custom_emoji_id TEXT"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass
 
         # Add per-channel auto-approve setting when upgrading an existing DB.
         try:
@@ -636,19 +654,21 @@ class Database:
         row_number,
         position,
         style="primary",
+        icon_custom_emoji_id=None,
     ):
         self.execute(
             """
             INSERT INTO message_buttons(
-                message_id,text,url,style,row_number,position,enabled
+                message_id,text,url,style,icon_custom_emoji_id,row_number,position,enabled
             )
-            VALUES(?,?,?,?,?,?,1)
+            VALUES(?,?,?,?,?,?,?,1)
             """,
             (
                 message_id,
                 text,
                 url,
                 style if style in BUTTON_STYLES else "primary",
+                str(icon_custom_emoji_id) if icon_custom_emoji_id else None,
                 row_number,
                 position,
             ),
@@ -770,26 +790,34 @@ def _make_inline_button(
     text: str,
     url: str,
     style: Optional[str] = None,
+    icon_custom_emoji_id: Optional[str] = None,
 ) -> InlineKeyboardButton:
-    """Create a Telegram inline URL button using the Bot API `style` field."""
-    return InlineKeyboardButton(
-        text=text[:64],
-        url=url,
-        style=normalize_button_style(style),
-    )
+    """Create a styled URL button using current Bot API fields."""
+    kwargs = {
+        "text": text[:64],
+        "url": url,
+        "style": normalize_button_style(style),
+    }
+    if icon_custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+    return InlineKeyboardButton(**kwargs)
 
 
 def _make_callback_button(
     text: str,
     callback_data: str,
     style: Optional[str] = None,
+    icon_custom_emoji_id: Optional[str] = None,
 ) -> InlineKeyboardButton:
-    """Create a styled Telegram callback button."""
-    return InlineKeyboardButton(
-        text=text[:64],
-        callback_data=callback_data,
-        style=normalize_button_style(style),
-    )
+    """Create a styled callback button."""
+    kwargs = {
+        "text": text[:64],
+        "callback_data": callback_data,
+        "style": normalize_button_style(style),
+    }
+    if icon_custom_emoji_id:
+        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
+    return InlineKeyboardButton(**kwargs)
 
 
 def build_keyboard(buttons):
@@ -797,49 +825,31 @@ def build_keyboard(buttons):
         return None
 
     rows = {}
-
     for index, button in enumerate(buttons[:MAX_BUTTONS]):
         if not isinstance(button, dict):
             continue
 
         text = str(button.get("text", "")).strip()
         url = str(button.get("url", "")).strip()
-
         if not text or not valid_http_url(url):
             continue
 
-        style = str(button.get("style", "primary")).strip()
-        row = max(0, safe_int(button.get("row"), 0))
-        position = max(
-            0,
-            safe_int(
-                button.get("position"),
-                index,
-            ),
-        )
-
+        style = normalize_button_style(button.get("style", "primary"))
+        icon_id = str(button.get("icon_custom_emoji_id", "") or "").strip() or None
+        row = max(0, safe_int(button.get("row", 0), 0))
+        position = max(0, safe_int(button.get("position", index), index))
         rows.setdefault(row, []).append(
             (
                 position,
-                _make_inline_button(text, url, style),
+                _make_inline_button(text, url, style, icon_id),
             )
         )
 
     keyboard_rows = []
-
     for row_number in sorted(rows):
-        row = sorted(
-            rows[row_number],
-            key=lambda item: item[0],
-        )
-        keyboard_rows.append(
-            [button for _, button in row]
-        )
+        keyboard_rows.append([button for _, button in sorted(rows[row_number], key=lambda item: item[0])])
 
-    if not keyboard_rows:
-        return None
-
-    return InlineKeyboardMarkup(keyboard_rows)
+    return InlineKeyboardMarkup(keyboard_rows) if keyboard_rows else None
 
 
 def start_keyboard():
@@ -1143,9 +1153,114 @@ def render_template_with_entities(text: str, entities, user):
 # chat_id so we can copy_message instead of re-sending the text.
 # ============================================================
 
+async def send_media_content(
+    bot,
+    chat_id: int,
+    media_type: str,
+    file_id: str,
+    caption: str,
+    entities,
+    parse_mode: Optional[str],
+    keyboard=None,
+):
+    """Send any supported media/text while preserving Telegram entities."""
+    media_type = (media_type or "none").lower()
+    caption = caption or ""
+    entities = list(entities or [])
+
+    if media_type == "photo" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "photo": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_photo(**kwargs)
+
+    if media_type == "video" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "video": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_video(**kwargs)
+
+    if media_type == "document" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "document": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_document(**kwargs)
+
+    if media_type == "animation" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "animation": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_animation(**kwargs)
+
+    if media_type == "audio" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "audio": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_audio(**kwargs)
+
+    if media_type == "voice" and file_id:
+        kwargs = {
+            "chat_id": chat_id,
+            "voice": file_id,
+            "caption": caption[:1024] or None,
+            "reply_markup": keyboard,
+        }
+        if entities:
+            kwargs["caption_entities"] = entities
+        elif parse_mode:
+            kwargs["parse_mode"] = parse_mode
+        return await bot.send_voice(**kwargs)
+
+    kwargs = {
+        "chat_id": chat_id,
+        "text": (caption or " ")[:MAX_TEXT_LENGTH],
+        "reply_markup": keyboard,
+        "disable_web_page_preview": True,
+    }
+    if entities:
+        kwargs["entities"] = entities
+    elif parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    return await bot.send_message(**kwargs)
+
+
 async def send_configured_message(bot, chat_id: int, user=None):
     message = db.get_join_message()
-
     if not message or not message["enabled"]:
         return None
 
@@ -1160,43 +1275,32 @@ async def send_configured_message(bot, chat_id: int, user=None):
             {
                 "text": row["text"],
                 "url": row["url"],
-                "style": normalize_button_style(
-                    row["style"] if "style" in row.keys() else "primary"
-                ),
+                "style": normalize_button_style(row["style"] if "style" in row.keys() else "primary"),
+                "icon_custom_emoji_id": row["icon_custom_emoji_id"] if "icon_custom_emoji_id" in row.keys() else None,
                 "row": row["row_number"],
                 "position": row["position"],
             }
         )
 
     keyboard = build_keyboard(buttons)
-
-    # If an admin supplied a message containing custom/premium emoji, store
-    # Telegram's original entities and reuse them directly. This avoids losing
-    # custom emoji while still allowing {Username} to be personalized.
     stored_entities = deserialize_message_entities(
-        db.get_setting("join_msg_source_entities", "[]"),
-        bot,
+        db.get_setting("join_msg_source_entities", "[]"), bot
     )
-
     rendered_caption, rendered_entities = render_template_with_entities(
-        caption,
-        stored_entities,
-        user,
+        caption, stored_entities, user
     )
 
     has_template = any(token in caption for token in USERNAME_PLACEHOLDERS)
     source_chat = safe_int(db.get_setting("join_msg_source_chat", "0"), 0)
     source_msg = safe_int(db.get_setting("join_msg_source_id", "0"), 0)
+    source_is_exact = db.get_setting("join_msg_source_exact", "0") == "1"
 
     for attempt in range(MAX_RETRIES):
         try:
-            # IMPORTANT: when there is no per-user template, always prefer the
-            # original Telegram message. copy_message preserves Telegram-side
-            # entities verbatim, including custom/premium emoji, formatting,
-            # spoilers and links. The previous build skipped this path whenever
-            # stored_entities was non-empty, which caused the preview to be
-            # reconstructed and made custom emoji unreliable.
-            if source_chat and source_msg and not has_template:
+            # Exact-copy path is the strongest custom-emoji preservation path.
+            # It is only used when the stored source message represents the
+            # complete configured message, not a separately supplied caption.
+            if source_chat and source_msg and source_is_exact and not has_template:
                 try:
                     return await bot.copy_message(
                         chat_id=chat_id,
@@ -1206,60 +1310,26 @@ async def send_configured_message(bot, chat_id: int, user=None):
                     )
                 except TelegramError as copy_exc:
                     logger.warning(
-                        "copy_message failed for configured message; using entity fallback: %s",
+                        "Configured copy_message fallback: %s",
                         clean_error(copy_exc)[:500],
                     )
-                    # Keep the source IDs so a transient Telegram error does not
-                    # permanently disable the exact-copy path.
 
-            if media_type == "photo" and file_id:
-                kwargs = {
-                    "chat_id": chat_id,
-                    "photo": file_id,
-                    "caption": (rendered_caption or "")[:1024] or None,
-                    "reply_markup": keyboard,
-                }
-                if rendered_entities:
-                    kwargs["caption_entities"] = rendered_entities
-                else:
-                    kwargs["parse_mode"] = parse_mode
-                return await bot.send_photo(**kwargs)
-
-            if media_type == "document" and file_id:
-                kwargs = {
-                    "chat_id": chat_id,
-                    "document": file_id,
-                    "caption": (rendered_caption or "")[:1024] or None,
-                    "reply_markup": keyboard,
-                }
-                if rendered_entities:
-                    kwargs["caption_entities"] = rendered_entities
-                else:
-                    kwargs["parse_mode"] = parse_mode
-                return await bot.send_document(**kwargs)
-
-            text = rendered_caption or " "
-            kwargs = {
-                "chat_id": chat_id,
-                "text": text[:MAX_TEXT_LENGTH],
-                "reply_markup": keyboard,
-                "disable_web_page_preview": True,
-            }
-            if rendered_entities:
-                kwargs["entities"] = rendered_entities
-            else:
-                kwargs["parse_mode"] = parse_mode
-
-            return await bot.send_message(**kwargs)
-
+            return await send_media_content(
+                bot,
+                chat_id,
+                media_type,
+                file_id,
+                rendered_caption,
+                rendered_entities,
+                parse_mode,
+                keyboard,
+            )
         except RetryAfter as exc:
             await asyncio.sleep(float(exc.retry_after) + 1)
-
         except (NetworkError, TimedOut):
             if attempt >= MAX_RETRIES - 1:
                 raise
             await asyncio.sleep(2 ** attempt)
-
         except BadRequest:
             raise
 
@@ -1579,18 +1649,16 @@ async def show_join_settings(query):
 
 async def show_message_builder(query):
     message = db.get_join_message()
-
     buttons = db.get_message_buttons(message["id"])
-
     media = message["media_type"] or "none"
     parse_mode = message["parse_mode"] or "HTML"
     caption = message["caption"] or "(empty)"
 
     btn_lines = []
     for b in buttons:
-        s = b["style"] if "style" in b.keys() else "primary"
-        btn_lines.append(f"  [{s}] {b['text']} → {b['url']}")
-
+        style = b["style"] if "style" in b.keys() else "primary"
+        icon = " ⭐" if ("icon_custom_emoji_id" in b.keys() and b["icon_custom_emoji_id"]) else ""
+        btn_lines.append(f"  [{style}]{icon} {b['text']} → {b['url']}")
     btn_preview = "\n".join(btn_lines) if btn_lines else "None"
 
     await query.edit_message_text(
@@ -1601,7 +1669,7 @@ async def show_message_builder(query):
             f"Buttons: {len(buttons)}\n"
             f"{btn_preview}\n\n"
             f"Caption:\n{caption[:800]}"
-        ),
+        )[:4000],
         reply_markup=InlineKeyboardMarkup(
             [
                 [
@@ -1609,7 +1677,7 @@ async def show_message_builder(query):
                     _make_callback_button("🔤 Parse", "toggle_parse", "primary"),
                 ],
                 [
-                    _make_callback_button("🖼 Photo", "set_photo", "primary"),
+                    _make_callback_button("🖼/🎥 Media", "set_media", "primary"),
                     _make_callback_button("🗑 Remove Media", "remove_media", "danger"),
                 ],
                 [
@@ -1741,21 +1809,33 @@ async def show_users(query):
 
 
 async def show_broadcast_menu(query):
+    recent = db.fetchall(
+        "SELECT id,status,total,sent,failed,blocked,created_at FROM broadcasts ORDER BY id DESC LIMIT 5"
+    )
+    lines = [
+        "📢 BROADCAST CENTER",
+        "",
+        "Supports text, photo, video, document, animation, audio and voice.",
+        "Premium/custom emoji are kept from the original Telegram message.",
+        "Buttons support blue/green/red styles and optional custom-emoji icons.",
+        "",
+        "Recent:",
+    ]
+    if recent:
+        for row in recent:
+            lines.append(
+                f"#{row['id']} — {row['status']} — {row['sent']}/{row['total']} sent, "
+                f"{row['failed']} failed, {row['blocked']} blocked"
+            )
+    else:
+        lines.append("No broadcasts yet.")
+
     await query.edit_message_text(
-        (
-            "📢 BROADCAST\n\n"
-            "Send text or photo (with caption) to all active users.\n"
-            "Premium emoji in captions are preserved automatically.\n\n"
-            "Handles rate limits and blocked users."
-        ),
+        "\n".join(lines)[:4000],
         reply_markup=InlineKeyboardMarkup(
             [
-                [
-                    _make_callback_button("➕ New Broadcast", "broadcast_start", "success")
-                ],
-                [
-                    _make_callback_button("⬅️ Back", "admin_home", "primary")
-                ],
+                [_make_callback_button("➕ New Broadcast", "broadcast_start", "success")],
+                [_make_callback_button("⬅️ Back", "admin_home", "primary")],
             ]
         ),
     )
@@ -1994,9 +2074,9 @@ async def admin_callback(
         if data == "set_caption":
             context.user_data["awaiting"] = "caption"
             await query.message.reply_text(
-                "Send the new caption.\n\n"
-                "Tip: If you want premium emoji in messages, send the caption with emoji here.\n"
-                "The bot will copy your message exactly so premium emoji are preserved.\n\n"
+                "Send the caption/text now.\n\n"
+                "Use Telegram's Custom Emoji picker for Premium Emoji. "
+                "The bot stores Telegram entities, so they are sent as custom emoji instead of normal emoji.\n\n"
                 "Use /cancel to cancel."
             )
             return
@@ -2013,10 +2093,11 @@ async def admin_callback(
             await show_message_builder(query)
             return
 
-        if data == "set_photo":
-            context.user_data["awaiting"] = "photo"
+        if data in ("set_photo", "set_media"):
+            context.user_data["awaiting"] = "media"
             await query.message.reply_text(
-                "Send the photo now.\n\n"
+                "Send photo, video, document, animation, audio or voice now.\n"
+                "You may include a Premium/custom-emoji caption.\n\n"
                 "Use /cancel to cancel."
             )
             return
@@ -2031,15 +2112,17 @@ async def admin_callback(
             # Clear copy_message source so we don't copy a deleted photo
             db.set_setting("join_msg_source_chat", "0")
             db.set_setting("join_msg_source_id", "0")
+            db.set_setting("join_msg_source_exact", "0")
             db.set_setting("join_msg_source_entities", "[]")
             await show_message_builder(query)
             return
 
         # FIXED: Guided button add flow instead of raw JSON
         if data == "add_button":
+            context.user_data["button_target"] = "join"
             context.user_data["awaiting"] = "btn_link"
             await query.message.reply_text(
-                "Step 1/3 — Send the channel or group link for this button.\n"
+                "Step 1/4 — Send the button URL.\n"
                 "Example: https://t.me/yourchannel\n\n"
                 "Use /cancel to cancel."
             )
@@ -2155,11 +2238,44 @@ async def admin_callback(
 
         if data == "broadcast_start":
             context.user_data["awaiting"] = "broadcast"
+            context.user_data["pending_broadcast_buttons"] = []
             await query.message.reply_text(
-                "Send the broadcast message.\n\n"
-                "Text, or photo with caption — premium emoji are preserved.\n\n"
+                "Send the broadcast content now.\n\n"
+                "Text, photo, video, document, animation, audio or voice are supported. "
+                "Premium/custom emoji are preserved from Telegram entities.\n\n"
                 "Use /cancel to cancel."
             )
+            return
+
+        if data == "broadcast_add_button":
+            if not context.user_data.get("pending_broadcast_id"):
+                await query.message.reply_text("No pending broadcast draft.")
+                return
+            context.user_data["button_target"] = "broadcast"
+            context.user_data["awaiting"] = "btn_link"
+            await query.message.reply_text(
+                "Step 1/4 — Send the button URL.\nExample: https://t.me/yourchannel\n\nUse /cancel to cancel."
+            )
+            return
+
+        if data == "broadcast_clear_buttons":
+            broadcast_id = context.user_data.get("pending_broadcast_id")
+            if broadcast_id:
+                context.user_data["pending_broadcast_buttons"] = []
+                db.execute(
+                    "UPDATE broadcasts SET buttons_json='[]' WHERE id=? AND status='pending'",
+                    (broadcast_id,),
+                    commit=True,
+                )
+            await query.message.reply_text("🗑 Broadcast buttons cleared.", reply_markup=broadcast_draft_keyboard())
+            return
+
+        if data == "broadcast_send":
+            broadcast_id = context.user_data.get("pending_broadcast_id")
+            if not broadcast_id:
+                await query.message.reply_text("No pending broadcast draft.")
+                return
+            await start_broadcast_send(query.message, context, broadcast_id)
             return
 
         if data == "backup_create":
@@ -2249,8 +2365,8 @@ async def admin_input(
 
     state = context.user_data.get("awaiting")
 
-    # ── Backup restore: admin sends a .db document ──────────────────────────
-    if message.document and message.document.file_name and message.document.file_name.endswith(".db"):
+    # Owner-only backup restore.
+    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".db"):
         if is_owner(user.id):
             await restore_backup_from_document(message, context)
         else:
@@ -2261,179 +2377,172 @@ async def admin_input(
         return
 
     try:
-        # ── Caption ──────────────────────────────────────────────────────────
         if state == "caption":
-            text = message.text or message.caption or ""
-
+            text = message.text if message.text is not None else (message.caption or "")
             if len(text) > MAX_TEXT_LENGTH:
-                await message.reply_text("Caption is too long.")
+                await message.reply_text("Caption is too long (maximum 4096 characters).")
                 return
 
             join_msg = db.get_join_message()
-
             db.execute(
                 "UPDATE messages SET caption=?,updated_at=? WHERE id=?",
                 (text, utc_now(), join_msg["id"]),
                 commit=True,
             )
 
-            # Store the original Telegram entities so custom/premium emoji and
-            # formatting survive while {Username} is replaced per recipient.
-            db.set_setting("join_msg_source_chat", str(message.chat_id))
-            db.set_setting("join_msg_source_id", str(message.message_id))
-            entities = message.entities or ()
-            db.set_setting(
-                "join_msg_source_entities",
-                serialize_message_entities(entities),
-            )
+            entities = message.entities or message.caption_entities or ()
+            db.set_setting("join_msg_source_entities", serialize_message_entities(entities))
 
-            custom_count = count_custom_emoji(entities)
-            logger.info(
-                "Saved join caption: entities=%d custom_emoji=%d chat=%s message=%s",
-                len(entities), custom_count, message.chat_id, message.message_id,
-            )
-
-            context.user_data.pop("awaiting", None)
-            if custom_count:
-                notice = f"✅ Caption saved. {custom_count} Premium/custom emoji detected and preserved."
-            else:
-                notice = (
-                    "✅ Caption saved. No custom/premium emoji entity was detected. "
-                    "Use Telegram's Custom Emoji picker (not a normal emoji) and send it again."
-                )
-            await message.reply_text(notice, reply_markup=admin_menu())
-            return
-
-        # ── Photo ────────────────────────────────────────────────────────────
-        if state == "photo":
-            if not message.photo:
-                await message.reply_text("Please send a photo.")
-                return
-
-            if len(message.caption or "") > 1024:
-                await message.reply_text("Photo caption is too long. Telegram allows up to 1024 characters.")
-                return
-
-            photo = message.photo[-1]
-            join_msg = db.get_join_message()
-
-            db.execute(
-                "UPDATE messages SET media_type='photo',file_id=?,updated_at=? WHERE id=?",
-                (photo.file_id, utc_now(), join_msg["id"]),
-                commit=True,
-            )
-
-            # If caption came with the photo, save it and source message too
-            if message.caption:
-                db.execute(
-                    "UPDATE messages SET caption=? WHERE id=?",
-                    (message.caption, join_msg["id"]),
-                    commit=True,
-                )
-                db.set_setting("join_msg_source_chat", str(message.chat_id))
-                db.set_setting("join_msg_source_id", str(message.message_id))
-                caption_entities = message.caption_entities or ()
-                db.set_setting(
-                    "join_msg_source_entities",
-                    serialize_message_entities(caption_entities),
-                )
-                logger.info(
-                    "Saved photo caption: entities=%d custom_emoji=%d chat=%s message=%s",
-                    len(caption_entities), count_custom_emoji(caption_entities),
-                    message.chat_id, message.message_id,
-                )
-            else:
-                # Clear stale source entities — this photo has no caption.
+            # A separately supplied caption is NOT an exact copy of the media
+            # message. Clear the exact-copy source whenever media is configured.
+            if (join_msg["media_type"] or "none") != "none" or message.caption:
                 db.set_setting("join_msg_source_chat", "0")
                 db.set_setting("join_msg_source_id", "0")
-                db.set_setting("join_msg_source_entities", "[]")
+                db.set_setting("join_msg_source_exact", "0")
+            else:
+                # Text-only message can be copied exactly, preserving all entities.
+                db.set_setting("join_msg_source_chat", str(message.chat_id))
+                db.set_setting("join_msg_source_id", str(message.message_id))
+                db.set_setting("join_msg_source_exact", "1")
 
+            custom_count = count_custom_emoji(entities)
             context.user_data.pop("awaiting", None)
-            await message.reply_text("✅ Photo saved.", reply_markup=admin_menu())
+            await message.reply_text(
+                f"✅ Caption saved. {custom_count} Premium/custom emoji entity(ies) detected.\n"
+                "Preview/Test will use Telegram entities directly.",
+                reply_markup=admin_menu(),
+            )
             return
 
-        # ── Guided button flow: Step 1 — link ────────────────────────────────
-        if state == "btn_link":
-            raw = (message.text or "").strip()
+        if state in ("media", "photo"):
+            media_type = None
+            file_id = None
+            caption = message.caption or ""
+            entities = message.caption_entities or ()
 
-            # Accept @username, t.me/ links, or full https:// links
-            if raw.startswith("@"):
-                raw = f"https://t.me/{raw.lstrip('@')}"
-            elif raw.startswith("t.me/") or raw.startswith("https://t.me/"):
-                if not raw.startswith("http"):
-                    raw = "https://" + raw
+            if message.photo:
+                media_type, file_id = "photo", message.photo[-1].file_id
+            elif message.video:
+                media_type, file_id = "video", message.video.file_id
+            elif message.animation:
+                media_type, file_id = "animation", message.animation.file_id
+            elif message.document:
+                media_type, file_id = "document", message.document.file_id
+            elif message.audio:
+                media_type, file_id = "audio", message.audio.file_id
+            elif message.voice:
+                media_type, file_id = "voice", message.voice.file_id
 
-            if not valid_http_url(raw):
+            if not media_type or not file_id:
                 await message.reply_text(
-                    "Invalid link. Send a channel link like:\n"
-                    "https://t.me/yourchannel\n"
-                    "or @yourchannel\n\n"
-                    "Use /cancel to cancel."
+                    "Send a photo, video, document, animation, audio or voice message."
                 )
                 return
 
+            if len(caption) > 1024:
+                await message.reply_text("Media caption is too long. Telegram allows up to 1024 characters.")
+                return
+
+            join_msg = db.get_join_message()
+            db.execute(
+                "UPDATE messages SET media_type=?,file_id=?,caption=?,updated_at=? WHERE id=?",
+                (media_type, file_id, caption, utc_now(), join_msg["id"]),
+                commit=True,
+            )
+            db.set_setting("join_msg_source_entities", serialize_message_entities(entities))
+
+            if caption:
+                # This exact source contains both media and caption.
+                db.set_setting("join_msg_source_chat", str(message.chat_id))
+                db.set_setting("join_msg_source_id", str(message.message_id))
+                db.set_setting("join_msg_source_exact", "1")
+            else:
+                # Do not accidentally copy a previous text/caption source.
+                db.set_setting("join_msg_source_chat", "0")
+                db.set_setting("join_msg_source_id", "0")
+                db.set_setting("join_msg_source_exact", "0")
+
+            context.user_data.pop("awaiting", None)
+            await message.reply_text(
+                f"✅ {media_type.title()} saved. {count_custom_emoji(entities)} Premium/custom emoji entity(ies) detected.",
+                reply_markup=admin_menu(),
+            )
+            return
+
+        if state == "btn_link":
+            raw = (message.text or "").strip()
+            if raw.startswith("@"):
+                raw = f"https://t.me/{raw.lstrip('@')}"
+            elif raw.startswith("t.me/"):
+                raw = "https://" + raw
+            if not valid_http_url(raw):
+                await message.reply_text(
+                    "Invalid URL. Send a full http(s) URL, e.g. https://t.me/yourchannel"
+                )
+                return
             context.user_data["btn_pending_url"] = raw
             context.user_data["awaiting"] = "btn_name"
             await message.reply_text(
-                "Step 2/3 — What should the button say?\n"
-                "Example: Join Now\n\n"
+                "Step 2/4 — Send the button label.\n\n"
+                "You can include one Premium/custom emoji. It will be used as the button icon.\n"
                 "Use /cancel to cancel."
             )
             return
 
-        # ── Guided button flow: Step 2 — button name ─────────────────────────
         if state == "btn_name":
-            name = (message.text or "").strip()
-
+            name = (message.text or message.caption or "").strip()
             if not name:
-                await message.reply_text("Button name cannot be empty. Try again.")
+                await message.reply_text("Button label cannot be empty.")
                 return
 
+            icon_id = None
+            entities = message.entities or message.caption_entities or ()
+            for entity in entities:
+                if getattr(entity, "type", None) == MessageEntity.CUSTOM_EMOJI:
+                    icon_id = getattr(entity, "custom_emoji_id", None)
+                    break
+
             context.user_data["btn_pending_name"] = name[:64]
+            context.user_data["btn_pending_icon"] = icon_id
             context.user_data["awaiting"] = "btn_style_choice"
             await message.reply_text(
-                "Step 3/3 — Choose button color style:",
+                "Step 3/4 — Choose button color:",
                 reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
-                            _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
-                            _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
-                        ]
-                    ]
+                    [[
+                        _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
+                        _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
+                        _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
+                    ]]
                 ),
             )
             return
 
-        # ── Guided button flow: Step 3 — waiting for inline style tap ────────
-        # User typed text instead of pressing the style button — remind them.
         if state == "btn_style_choice":
             await message.reply_text(
-                "Please tap one of the color buttons above to finish adding the button.\n\n"
-                "Use /cancel to abort.",
+                "Please tap a color button above.",
                 reply_markup=InlineKeyboardMarkup(
-                    [
-                        [
-                            _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
-                            _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
-                            _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
-                        ]
-                    ]
+                    [[
+                        _make_callback_button("🔵 Primary", "btn_add_style:primary", "primary"),
+                        _make_callback_button("🟢 Success", "btn_add_style:success", "success"),
+                        _make_callback_button("🔴 Danger", "btn_add_style:danger", "danger"),
+                    ]]
                 ),
             )
             return
 
-        # ── Channel add ───────────────────────────────────────────────────────
+        if state == "broadcast_buttons":
+            await message.reply_text(
+                "Broadcast draft is ready. Use the buttons below to add buttons or send it.",
+                reply_markup=broadcast_draft_keyboard(),
+            )
+            return
+
         if state == "channel":
             raw = (message.text or "").strip()
-
-            # Accept @username or t.me/ link
             if raw.startswith("@"):
                 raw = raw.lstrip("@")
             elif "t.me/" in raw:
-                raw = raw.split("t.me/")[-1].rstrip("/")
-
-            # Try as username first, fallback to numeric ID
+                raw = raw.split("t.me/", 1)[1].split("/", 1)[0]
             try:
                 try:
                     channel_id_or_username = int(raw)
@@ -2441,64 +2550,37 @@ async def admin_input(
                     channel_id_or_username = f"@{raw}"
 
                 chat = await context.bot.get_chat(channel_id_or_username)
-
                 if chat.type != "channel":
-                    await message.reply_text("Please provide a Telegram channel link or ID.")
+                    await message.reply_text("Please provide a Telegram channel username/link or numeric ID.")
                     return
 
                 member = await context.bot.get_chat_member(chat.id, context.bot.id)
-                status = str(getattr(member, "status", ""))
-
-                if status not in ("administrator", "creator"):
+                if str(getattr(member, "status", "")) not in ("administrator", "creator"):
                     await message.reply_text("Bot is not an administrator in this channel.")
                     return
 
                 now = utc_now()
-
                 db.execute(
                     """
                     INSERT INTO channels(
-                        channel_id,username,title,type,
-                        enabled,required,auto_approve,sort_order,
-                        created_at,updated_at
-                    )
-                    VALUES(?,?,?,?,1,1,0,0,?,?)
+                        channel_id,username,title,type,enabled,required,auto_approve,sort_order,created_at,updated_at
+                    ) VALUES(?,?,?,?,1,1,0,0,?,?)
                     ON CONFLICT(channel_id) DO UPDATE SET
-                        username=excluded.username,
-                        title=excluded.title,
-                        type=excluded.type,
-                        updated_at=excluded.updated_at
+                        username=excluded.username,title=excluded.title,type=excluded.type,updated_at=excluded.updated_at
                     """,
-                    (
-                        chat.id,
-                        chat.username,
-                        chat.title or "",
-                        chat.type,
-                        now,
-                        now,
-                    ),
+                    (chat.id, chat.username, chat.title or "", chat.type, now, now),
                     commit=True,
                 )
-
                 context.user_data.pop("awaiting", None)
-
-                conf = (
-                    f"✅ Channel configured.\n\n"
-                    f"Title: {chat.title or '-'}\n"
-                    f"ID: {chat.id}\n"
-                )
-                if chat.username:
-                    conf += f"Username: @{chat.username}"
-
-                await message.reply_text(conf, reply_markup=admin_menu())
-
-            except TelegramError as exc:
                 await message.reply_text(
-                    f"Could not access the channel.\n\n{clean_error(exc)[:700]}"
+                    f"✅ Channel configured.\n\nTitle: {chat.title or '-'}\nID: {chat.id}\n"
+                    + (f"Username: @{chat.username}" if chat.username else ""),
+                    reply_markup=admin_menu(),
                 )
+            except TelegramError as exc:
+                await message.reply_text(f"Could not access the channel.\n\n{clean_error(exc)[:700]}")
             return
 
-        # ── Broadcast ─────────────────────────────────────────────────────────
         if state == "broadcast":
             await create_broadcast(update, context)
             return
@@ -2506,9 +2588,7 @@ async def admin_input(
     except Exception as exc:
         logger.exception("Admin input failed: %s", state)
         db.log_error("EXCEPTION", "admin_input", state, repr(exc))
-        await message.reply_text(
-            f"Operation failed safely:\n{clean_error(exc)[:700]}"
-        )
+        await message.reply_text(f"Operation failed safely:\n{clean_error(exc)[:700]}")
 
 
 # Callback handler for the button-style picker (step 3 of guided flow)
@@ -2517,64 +2597,97 @@ async def btn_add_style_callback(
     context: ContextTypes.DEFAULT_TYPE,
 ):
     query = update.callback_query
-
     if not query:
         return
 
     user = query.from_user
-
     if not user or not is_admin(user.id):
         await query.answer("Access Denied", show_alert=True)
         return
 
     data = query.data or ""
-
     if not data.startswith("btn_add_style:"):
         return
 
-    style = data.split(":", 1)[1]
+    style = normalize_button_style(data.split(":", 1)[1])
     url = context.user_data.pop("btn_pending_url", None)
     name = context.user_data.pop("btn_pending_name", None)
+    icon_id = context.user_data.pop("btn_pending_icon", None)
+    target = context.user_data.get("button_target", "join")
     context.user_data.pop("awaiting", None)
 
     await query.answer()
-
     if not url or not name:
-        await query.message.reply_text("Button data lost. Start over with Add Button.")
+        await query.message.reply_text("Button data expired. Start Add Button again.")
+        return
+
+    button = {
+        "text": name[:64],
+        "url": url,
+        "style": style,
+        "icon_custom_emoji_id": icon_id,
+        "row": 0,
+        "position": 0,
+    }
+
+    if target == "broadcast":
+        buttons = context.user_data.setdefault("pending_broadcast_buttons", [])
+        button["row"] = len(buttons)
+        button["position"] = 0
+        buttons.append(button)
+        broadcast_id = context.user_data.get("pending_broadcast_id")
+        if broadcast_id:
+            db.execute(
+                "UPDATE broadcasts SET buttons_json=? WHERE id=? AND status='pending'",
+                (json.dumps(buttons, ensure_ascii=False), broadcast_id),
+                commit=True,
+            )
+        await query.message.reply_text(
+            f"✅ Broadcast button added: [{style.upper()}] {name}\n"
+            + ("⭐ Premium button icon saved." if icon_id else ""),
+            reply_markup=broadcast_draft_keyboard(),
+        )
         return
 
     join_msg = db.get_join_message()
-    existing_buttons = db.get_message_buttons(join_msg["id"])
-    next_row = len(existing_buttons)
-
+    existing = db.get_message_buttons(join_msg["id"])
+    next_row = len(existing)
     db.add_message_button(
         join_msg["id"],
         name,
         url,
         row_number=next_row,
         position=0,
-        style=style if style in BUTTON_STYLES else "primary",
+        style=style,
+        icon_custom_emoji_id=icon_id,
     )
-
     await query.message.reply_text(
-        f"✅ Button added: [{style.upper()}] {name} → {url}",
+        f"✅ Button added: [{style.upper()}] {name}\n"
+        + ("⭐ Premium button icon saved." if icon_id else ""),
         reply_markup=admin_menu(),
     )
 
 
 # ============================================================
 # BROADCAST
-# Premium emoji fix: store source_chat_id + source_message_id so
-# run_broadcast uses copy_message instead of re-sending text.
 # ============================================================
 
-async def create_broadcast(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+def broadcast_draft_keyboard():
+    return InlineKeyboardMarkup(
+        [
+            [_make_callback_button("➕ Add Button", "broadcast_add_button", "success")],
+            [
+                _make_callback_button("🚀 Send Now", "broadcast_send", "success"),
+                _make_callback_button("🗑 Clear Buttons", "broadcast_clear_buttons", "danger"),
+            ],
+            [_make_callback_button("⬅️ Broadcast Center", "admin_broadcast", "primary")],
+        ]
+    )
+
+
+async def create_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     message = update.message
-
     if not user or not message:
         return
 
@@ -2582,41 +2695,54 @@ async def create_broadcast(
     file_id = None
     text = ""
     caption = ""
-    source_chat_id = message.chat_id
-    source_message_id = message.message_id
+    source_entities = message.entities or ()
 
     if message.photo:
-        media_type = "photo"
-        file_id = message.photo[-1].file_id
+        media_type, file_id = "photo", message.photo[-1].file_id
         caption = message.caption or ""
         source_entities = message.caption_entities or ()
-        max_len = 1024
+    elif message.video:
+        media_type, file_id = "video", message.video.file_id
+        caption = message.caption or ""
+        source_entities = message.caption_entities or ()
+    elif message.animation:
+        media_type, file_id = "animation", message.animation.file_id
+        caption = message.caption or ""
+        source_entities = message.caption_entities or ()
+    elif message.document:
+        media_type, file_id = "document", message.document.file_id
+        caption = message.caption or ""
+        source_entities = message.caption_entities or ()
+    elif message.audio:
+        media_type, file_id = "audio", message.audio.file_id
+        caption = message.caption or ""
+        source_entities = message.caption_entities or ()
+    elif message.voice:
+        media_type, file_id = "voice", message.voice.file_id
+        caption = message.caption or ""
+        source_entities = message.caption_entities or ()
     else:
         text = message.text or ""
         caption = text
         source_entities = message.entities or ()
-        max_len = MAX_TEXT_LENGTH
 
-    if not text and not caption:
+    content = caption if media_type != "none" else text
+    max_len = 1024 if media_type != "none" else MAX_TEXT_LENGTH
+    if not content and media_type == "none":
         await message.reply_text("Broadcast content cannot be empty.")
         return
-
-    if len(text or caption) > max_len:
-        await message.reply_text(
-            f"Broadcast content is too long. Maximum: {max_len} characters."
-        )
+    if len(content) > max_len:
+        await message.reply_text(f"Broadcast content is too long. Maximum: {max_len} characters.")
         return
 
+    buttons = context.user_data.get("pending_broadcast_buttons", [])
     entities_json = serialize_message_entities(source_entities)
-
     cursor = db.execute(
         """
         INSERT INTO broadcasts(
-            admin_id,text,media_type,file_id,caption,
-            parse_mode,source_chat_id,source_message_id,entities_json,
-            buttons_json,status,created_at
-        )
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+            admin_id,text,media_type,file_id,caption,parse_mode,
+            source_chat_id,source_message_id,entities_json,buttons_json,status,created_at
+        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         """,
         (
             user.id,
@@ -2625,53 +2751,51 @@ async def create_broadcast(
             file_id,
             caption,
             db.get_join_message()["parse_mode"] or "HTML",
-            source_chat_id,
-            source_message_id,
+            message.chat_id,
+            message.message_id,
             entities_json,
-            "[]",
+            json.dumps(buttons, ensure_ascii=False),
             "pending",
             utc_now(),
         ),
         commit=True,
     )
-
     broadcast_id = cursor.lastrowid
     context.user_data["pending_broadcast_id"] = broadcast_id
+    context.user_data["awaiting"] = "broadcast_buttons"
 
+    custom_count = count_custom_emoji(source_entities)
     await message.reply_text(
-        f"📢 Broadcast #{broadcast_id} created.\n\n"
-        "Premium emoji are preserved automatically.\n\n"
-        "Reply /broadcast_confirm to send.\n"
-        "Or /cancel"
+        f"📢 Broadcast #{broadcast_id} ready.\n\n"
+        f"Type: {media_type}\n"
+        f"Premium/custom emoji: {custom_count}\n"
+        f"Buttons: {len(buttons)}\n\n"
+        "Add buttons or tap Send Now. The original Telegram message is copied "
+        "when possible, preserving its entities exactly.",
+        reply_markup=broadcast_draft_keyboard(),
     )
 
 
-async def broadcast_confirm(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
+async def broadcast_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
-
     user = update.effective_user
-
     if not user or not is_admin(user.id):
         await update.message.reply_text("Access Denied")
         return
 
     broadcast_id = context.user_data.get("pending_broadcast_id")
-
     if not broadcast_id:
         await update.message.reply_text("No pending broadcast.")
         return
 
-    row = db.fetchone(
-        "SELECT * FROM broadcasts WHERE id=? AND status='pending'",
-        (broadcast_id,),
-    )
+    await start_broadcast_send(update.message, context, broadcast_id)
 
+
+async def start_broadcast_send(message, context, broadcast_id):
+    row = db.fetchone("SELECT * FROM broadcasts WHERE id=? AND status='pending'", (broadcast_id,))
     if not row:
-        await update.message.reply_text("Pending broadcast not found.")
+        await message.reply_text("Pending broadcast not found or already sent.")
         return
 
     db.execute(
@@ -2679,30 +2803,21 @@ async def broadcast_confirm(
         (utc_now(), broadcast_id),
         commit=True,
     )
-
     context.user_data.pop("pending_broadcast_id", None)
-
-    await update.message.reply_text(f"📢 Broadcast #{broadcast_id} started.")
-
-    context.application.create_task(
-        run_broadcast(context.application, broadcast_id)
-    )
+    context.user_data.pop("pending_broadcast_buttons", None)
+    context.user_data.pop("button_target", None)
+    context.user_data.pop("awaiting", None)
+    await message.reply_text(f"📢 Broadcast #{broadcast_id} started.")
+    context.application.create_task(run_broadcast(context.application, broadcast_id))
 
 
 async def send_broadcast_to_user(bot, row, user_id: int):
-    """Send a broadcast while preserving Telegram message entities.
-
-    Exact-copy is the primary path because Telegram itself carries custom/premium
-    emoji as MessageEntity.CUSTOM_EMOJI. A stored-entity fallback is kept for
-    cases where copy_message is temporarily unavailable.
-    """
+    """Copy the original Telegram message first, then use an entity-preserving fallback."""
     source_chat = safe_int(row["source_chat_id"] if "source_chat_id" in row.keys() else 0, 0)
     source_msg = safe_int(row["source_message_id"] if "source_message_id" in row.keys() else 0, 0)
     buttons = parse_json(row["buttons_json"], [])
     keyboard = build_keyboard(buttons)
 
-    # Best path: exact Telegram-side copy. This preserves custom/premium emoji
-    # without reparsing or re-encoding the message.
     if source_chat and source_msg:
         try:
             return await bot.copy_message(
@@ -2714,204 +2829,108 @@ async def send_broadcast_to_user(bot, row, user_id: int):
         except TelegramError as copy_exc:
             logger.warning(
                 "Broadcast copy_message fallback for user %s: %s",
-                user_id, clean_error(copy_exc)[:500],
+                user_id,
+                clean_error(copy_exc)[:500],
             )
 
-    entities = deserialize_message_entities(
-        row["entities_json"] if "entities_json" in row.keys() else "[]",
+    entities = deserialize_message_entities(row["entities_json"] if "entities_json" in row.keys() else "[]", bot)
+    return await send_media_content(
         bot,
+        user_id,
+        row["media_type"] or "none",
+        row["file_id"] or "",
+        row["caption"] if row["media_type"] != "none" else (row["text"] or row["caption"] or " "),
+        entities,
+        row["parse_mode"] or None,
+        keyboard,
     )
-
-    if row["media_type"] == "photo" and row["file_id"]:
-        kwargs = {
-            "chat_id": user_id,
-            "photo": row["file_id"],
-            "caption": (row["caption"] or "")[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        else:
-            kwargs["parse_mode"] = row["parse_mode"] or None
-        return await bot.send_photo(**kwargs)
-
-    kwargs = {
-        "chat_id": user_id,
-        "text": (row["text"] or row["caption"] or " ")[:MAX_TEXT_LENGTH],
-        "reply_markup": keyboard,
-        "disable_web_page_preview": True,
-    }
-    if entities:
-        kwargs["entities"] = entities
-    else:
-        kwargs["parse_mode"] = row["parse_mode"] or None
-    return await bot.send_message(**kwargs)
 
 
 async def run_broadcast(application: Application, broadcast_id: int):
     try:
-        row = db.fetchone(
-            "SELECT * FROM broadcasts WHERE id=?",
-            (broadcast_id,),
-        )
-
+        row = db.fetchone("SELECT * FROM broadcasts WHERE id=?", (broadcast_id,))
         if not row:
             return
 
-        users = db.fetchall(
-            "SELECT user_id FROM users WHERE is_blocked=0 ORDER BY user_id"
+        users = db.fetchall("SELECT user_id FROM users WHERE is_blocked=0 ORDER BY user_id")
+        total_row = db.fetchone("SELECT COUNT(*) AS c FROM users")
+        total = int(total_row["c"]) if total_row else len(users)
+        db.execute("UPDATE broadcasts SET total=? WHERE id=?", (total, broadcast_id), commit=True)
+
+        count_rows = db.fetchall(
+            "SELECT status,COUNT(*) AS c FROM broadcast_logs WHERE broadcast_id=? GROUP BY status",
+            (broadcast_id,),
         )
-
-        total = len(users)
-
-        db.execute(
-            "UPDATE broadcasts SET total=? WHERE id=?",
-            (total, broadcast_id),
-            commit=True,
-        )
-
-        sent = 0
-        failed = 0
-        blocked = 0
-
+        counts = {row["status"]: int(row["c"]) for row in count_rows}
+        sent = counts.get("sent", 0)
+        failed = counts.get("failed", 0)
+        blocked = counts.get("blocked", 0)
         for item in users:
             user_id = item["user_id"]
-
             existing = db.fetchone(
-                """
-                SELECT status FROM broadcast_logs
-                WHERE broadcast_id=? AND user_id=?
-                """,
+                "SELECT status FROM broadcast_logs WHERE broadcast_id=? AND user_id=?",
                 (broadcast_id, user_id),
             )
-
             if existing and existing["status"] in ("sent", "blocked"):
                 continue
 
             try:
                 await send_broadcast_to_user(application.bot, row, user_id)
                 sent += 1
-
-                db.execute(
-                    """
-                    INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
-                        status=excluded.status,error=excluded.error,
-                        created_at=excluded.created_at
-                    """,
-                    (broadcast_id, user_id, "sent", None, utc_now()),
-                    commit=True,
-                )
-
+                status, error = "sent", None
             except Forbidden as exc:
                 blocked += 1
-                db.execute(
-                    "UPDATE users SET is_blocked=1 WHERE user_id=?",
-                    (user_id,),
-                    commit=True,
-                )
-                db.execute(
-                    """
-                    INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
-                        status=excluded.status,error=excluded.error,
-                        created_at=excluded.created_at
-                    """,
-                    (broadcast_id, user_id, "blocked", clean_error(exc), utc_now()),
-                    commit=True,
-                )
-
+                status, error = "blocked", clean_error(exc)
+                db.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (user_id,), commit=True)
             except RetryAfter as exc:
+                await asyncio.sleep(float(exc.retry_after) + 1)
                 try:
-                    await asyncio.sleep(float(exc.retry_after) + 1)
                     await send_broadcast_to_user(application.bot, row, user_id)
                     sent += 1
-                    db.execute(
-                        """
-                        INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
-                        VALUES(?,?,?,?,?)
-                        ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
-                            status=excluded.status,error=excluded.error,
-                            created_at=excluded.created_at
-                        """,
-                        (broadcast_id, user_id, "sent", None, utc_now()),
-                        commit=True,
-                    )
+                    status, error = "sent", None
                 except Forbidden as retry_exc:
                     blocked += 1
-                    db.execute(
-                        "UPDATE users SET is_blocked=1 WHERE user_id=?",
-                        (user_id,),
-                        commit=True,
-                    )
-                    db.log_error("WARNING", "broadcast", "retry_forbidden", repr(retry_exc))
+                    status, error = "blocked", clean_error(retry_exc)
+                    db.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (user_id,), commit=True)
                 except Exception as retry_exc:
                     failed += 1
-                    db.log_error("WARNING", "broadcast", "retry_failed", repr(retry_exc))
-
+                    status, error = "failed", clean_error(retry_exc)
             except (NetworkError, TimedOut) as exc:
                 failed += 1
-                db.execute(
-                    """
-                    INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
-                        status=excluded.status,error=excluded.error,
-                        created_at=excluded.created_at
-                    """,
-                    (broadcast_id, user_id, "failed", clean_error(exc), utc_now()),
-                    commit=True,
-                )
-
+                status, error = "failed", clean_error(exc)
             except Exception as exc:
                 failed += 1
-                db.execute(
-                    """
-                    INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
-                    VALUES(?,?,?,?,?)
-                    ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
-                        status=excluded.status,error=excluded.error,
-                        created_at=excluded.created_at
-                    """,
-                    (broadcast_id, user_id, "failed", clean_error(exc), utc_now()),
-                    commit=True,
-                )
+                status, error = "failed", clean_error(exc)
 
             db.execute(
                 """
-                UPDATE broadcasts
-                SET sent=?,failed=?,blocked=?,next_user_id=?
-                WHERE id=?
+                INSERT INTO broadcast_logs(broadcast_id,user_id,status,error,created_at)
+                VALUES(?,?,?,?,?)
+                ON CONFLICT(broadcast_id,user_id) DO UPDATE SET
+                    status=excluded.status,error=excluded.error,created_at=excluded.created_at
                 """,
+                (broadcast_id, user_id, status, error, utc_now()),
+                commit=True,
+            )
+            db.execute(
+                "UPDATE broadcasts SET sent=?,failed=?,blocked=?,next_user_id=? WHERE id=?",
                 (sent, failed, blocked, user_id, broadcast_id),
                 commit=True,
             )
-
             await asyncio.sleep(BROADCAST_DELAY)
 
         db.execute(
             """
-            UPDATE broadcasts
-            SET status='completed',sent=?,failed=?,blocked=?,
-                next_user_id=NULL,finished_at=?
+            UPDATE broadcasts SET status='completed',sent=?,failed=?,blocked=?,next_user_id=NULL,finished_at=?
             WHERE id=?
             """,
             (sent, failed, blocked, utc_now(), broadcast_id),
             commit=True,
         )
-
         db.log_event(
             "broadcast_completed",
-            details=(
-                f"id={broadcast_id};"
-                f"sent={sent};"
-                f"failed={failed};"
-                f"blocked={blocked}"
-            ),
+            details=f"id={broadcast_id};sent={sent};failed={failed};blocked={blocked}",
         )
-
     except Exception as exc:
         logger.exception("Broadcast crashed safely")
         db.execute(
@@ -3126,6 +3145,18 @@ async def post_init(application: Application):
             ]
         )
 
+        # Resume broadcasts that were interrupted by a Render restart/deploy.
+        pending = db.fetchall(
+            "SELECT id FROM broadcasts WHERE status IN ('running','paused') ORDER BY id"
+        )
+        for row in pending:
+            db.execute(
+                "UPDATE broadcasts SET status='running' WHERE id=?",
+                (row["id"],),
+                commit=True,
+            )
+            application.create_task(run_broadcast(application, int(row["id"])))
+
         db.log_event(
             "startup",
             details=f"bot_id={me.id};username={me.username}",
@@ -3179,7 +3210,15 @@ def build_application() -> Application:
         MessageHandler(
             (
                 filters.ChatType.PRIVATE
-                & (filters.TEXT | filters.PHOTO | filters.Document.ALL)
+                & (
+                    filters.TEXT
+                    | filters.PHOTO
+                    | filters.VIDEO
+                    | filters.ANIMATION
+                    | filters.AUDIO
+                    | filters.VOICE
+                    | filters.Document.ALL
+                )
                 & ~filters.COMMAND
             ),
             admin_input,
@@ -3197,18 +3236,36 @@ def main():
 
     application = build_application()
 
-    logger.info("Starting Telegram polling...")
+    allowed_updates = [
+        "message",
+        "callback_query",
+        "chat_join_request",
+    ]
 
-    # Render / cloud hosting fix: drop close_loop kwarg (removed in PTB 20.x)
-    # run_polling handles the event loop internally — don't pass close_loop.
-    application.run_polling(
-        allowed_updates=[
-            "message",
-            "callback_query",
-            "chat_join_request",
-        ],
-        drop_pending_updates=False,
-    )
+    # Render web services expose RENDER_EXTERNAL_URL automatically. When it is
+    # present, use Telegram webhooks instead of getUpdates polling. This is
+    # important for Render because Free web services can spin down while idle;
+    # Telegram webhook traffic can wake the service back up. Local/non-Render
+    # runs continue to use polling.
+    if RENDER_EXTERNAL_URL:
+        webhook_url = f"{RENDER_EXTERNAL_URL}/{WEBHOOK_PATH}"
+        logger.info("Starting Telegram webhook on 0.0.0.0:%s", RENDER_PORT)
+        logger.info("Webhook URL: %s", webhook_url)
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=RENDER_PORT,
+            url_path=WEBHOOK_PATH,
+            webhook_url=webhook_url,
+            allowed_updates=allowed_updates,
+            drop_pending_updates=False,
+            secret_token=WEBHOOK_SECRET or None,
+        )
+    else:
+        logger.info("Starting Telegram polling...")
+        application.run_polling(
+            allowed_updates=allowed_updates,
+            drop_pending_updates=False,
+        )
 
 
 if __name__ == "__main__":
