@@ -225,6 +225,7 @@ class Database:
                 type TEXT,
                 enabled INTEGER NOT NULL DEFAULT 1,
                 required INTEGER NOT NULL DEFAULT 1,
+                auto_approve INTEGER NOT NULL DEFAULT 0,
                 sort_order INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -362,6 +363,15 @@ class Database:
         try:
             self.conn.execute(
                 "ALTER TABLE message_buttons ADD COLUMN style TEXT NOT NULL DEFAULT 'primary'"
+            )
+            self.conn.commit()
+        except sqlite3.OperationalError:
+            pass  # Column already exists
+
+        # Add per-channel auto-approve setting when upgrading an existing DB.
+        try:
+            self.conn.execute(
+                "ALTER TABLE channels ADD COLUMN auto_approve INTEGER NOT NULL DEFAULT 0"
             )
             self.conn.commit()
         except sqlite3.OperationalError:
@@ -976,6 +986,10 @@ def serialize_message_entities(entities) -> str:
     return json.dumps(result, ensure_ascii=False)
 
 
+def count_custom_emoji(entities) -> int:
+    return sum(1 for e in (entities or ()) if getattr(e, "type", "") == MessageEntity.CUSTOM_EMOJI)
+
+
 def deserialize_message_entities(value: str, bot=None):
     """Restore MessageEntity objects from stored JSON."""
     raw = parse_json(value, [])
@@ -1339,29 +1353,45 @@ async def handle_join_request(
 
         db.log_event("join_request_received", user.id, chat.id)
 
-        if db.get_setting("auto_message_enabled", "1") != "1":
-            db.update_join_request(row_id, sent=False, status="disabled")
-            return
+        dm_sent = False
 
-        try:
-            await send_configured_message(context.bot, user.id, user)
+        if db.get_setting("auto_message_enabled", "1") == "1":
+            try:
+                dm_chat_id = getattr(request, "user_chat_id", None) or user.id
+                await send_configured_message(context.bot, dm_chat_id, user)
+                dm_sent = True
+                db.log_event("join_request_message_sent", user.id, chat.id)
+            except Forbidden as exc:
+                error = clean_error(exc)
+                db.execute(
+                    "UPDATE users SET is_blocked=1 WHERE user_id=?",
+                    (user.id,),
+                    commit=True,
+                )
+                db.log_error("WARNING", "join_request", "forbidden", error)
+                db.update_join_request(row_id, sent=False, status="blocked", error=error)
+            except Exception as exc:
+                error = clean_error(exc)
+                db.log_error("ERROR", "join_request", "send_failed", error)
+                db.update_join_request(row_id, sent=False, status="failed", error=error)
+
+        if channel["auto_approve"]:
+            try:
+                await context.bot.approve_chat_join_request(
+                    chat_id=chat.id,
+                    user_id=user.id,
+                )
+                db.log_event("join_request_auto_approved", user.id, chat.id)
+                final_status = "auto_approved" if dm_sent else "auto_approved_dm_failed"
+                db.update_join_request(row_id, sent=dm_sent, status=final_status)
+            except TelegramError as exc:
+                error = clean_error(exc)
+                db.update_join_request(
+                    row_id, sent=dm_sent, status="approve_failed", error=error
+                )
+                db.log_error("ERROR", "join_request", "approve_failed", error)
+        elif dm_sent:
             db.update_join_request(row_id, sent=True, status="sent")
-            db.log_event("join_request_message_sent", user.id, chat.id)
-
-        except Forbidden as exc:
-            error = clean_error(exc)
-            db.execute(
-                "UPDATE users SET is_blocked=1 WHERE user_id=?",
-                (user.id,),
-                commit=True,
-            )
-            db.update_join_request(row_id, sent=False, status="blocked", error=error)
-            db.log_error("WARNING", "join_request", "forbidden", error)
-
-        except Exception as exc:
-            error = clean_error(exc)
-            db.update_join_request(row_id, sent=False, status="failed", error=error)
-            db.log_error("ERROR", "join_request", "send_failed", error)
 
     except Exception as exc:
         logger.exception("Join request handler failed")
@@ -1520,7 +1550,8 @@ async def show_join_settings(query):
         (
             "📩 JOIN REQUEST SETTINGS\n\n"
             f"Auto Message: {'ON' if enabled == '1' else 'OFF'}\n\n"
-            "Only enabled/configured channels are processed."
+            "Only enabled/configured channels are processed.\n"
+            "Auto Approve is controlled per channel from Channel Manager."
         ),
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1601,10 +1632,12 @@ async def show_channels(query):
                 or channel["username"]
                 or str(channel["channel_id"])
             )
+            auto = "ON" if channel["auto_approve"] else "OFF"
             lines.append(
                 f"• {title}\n"
                 f"  ID: {channel['channel_id']}\n"
                 f"  Status: {status}\n"
+                f"  Auto Approve: {auto}\n"
             )
 
     rows = [
@@ -1623,10 +1656,19 @@ async def show_channels(query):
                     "primary",
                 ),
                 _make_callback_button(
-                    "🗑",
+                    ("✅ Auto Approve" if channel["auto_approve"] else "⏸ Auto Approve"),
+                    f"channel_auto:{channel['channel_id']}",
+                    "success" if channel["auto_approve"] else "danger",
+                ),
+            ]
+        )
+        rows.append(
+            [
+                _make_callback_button(
+                    "🗑 Remove Channel",
                     f"remove_channel:{channel['channel_id']}",
                     "danger",
-                ),
+                )
             ]
         )
 
@@ -2022,6 +2064,56 @@ async def admin_callback(
             await show_channels(query)
             return
 
+        if data.startswith("channel_auto:"):
+            channel_id = safe_int(data.split(":", 1)[1], None)
+
+            if channel_id is None:
+                await query.message.reply_text("Invalid channel action.")
+                return
+
+            row = db.fetchone(
+                "SELECT * FROM channels WHERE channel_id=?",
+                (channel_id,),
+            )
+            if not row:
+                await query.message.reply_text("Channel not found.")
+                return
+
+            # Enabling auto-approve requires the bot to be an administrator
+            # with permission to invite users. Check before saving the setting.
+            if not row["auto_approve"]:
+                try:
+                    member = await context.bot.get_chat_member(
+                        chat_id=channel_id,
+                        user_id=context.bot.id,
+                    )
+                    can_invite = bool(getattr(member, "can_invite_users", False))
+                    if getattr(member, "status", None) not in ("administrator", "creator") or not can_invite:
+                        await query.answer(
+                            "Bot needs admin + Invite Users permission for auto-approve.",
+                            show_alert=True,
+                        )
+                        return
+                except TelegramError as exc:
+                    await query.answer(
+                        f"Cannot verify channel permissions: {clean_error(exc)[:120]}",
+                        show_alert=True,
+                    )
+                    return
+
+            db.execute(
+                """
+                UPDATE channels
+                SET auto_approve=CASE auto_approve WHEN 1 THEN 0 ELSE 1 END,
+                    updated_at=?
+                WHERE channel_id=?
+                """,
+                (utc_now(), channel_id),
+                commit=True,
+            )
+            await show_channels(query)
+            return
+
         if data.startswith("remove_channel:"):
             channel_id = safe_int(data.split(":", 1)[1], None)
 
@@ -2178,13 +2270,27 @@ async def admin_input(
             # formatting survive while {Username} is replaced per recipient.
             db.set_setting("join_msg_source_chat", str(message.chat_id))
             db.set_setting("join_msg_source_id", str(message.message_id))
+            entities = message.entities or ()
             db.set_setting(
                 "join_msg_source_entities",
-                serialize_message_entities(message.entities or ()),
+                serialize_message_entities(entities),
+            )
+
+            custom_count = count_custom_emoji(entities)
+            logger.info(
+                "Saved join caption: entities=%d custom_emoji=%d chat=%s message=%s",
+                len(entities), custom_count, message.chat_id, message.message_id,
             )
 
             context.user_data.pop("awaiting", None)
-            await message.reply_text("✅ Caption saved. Premium/custom emoji and formatting saved.", reply_markup=admin_menu())
+            if custom_count:
+                notice = f"✅ Caption saved. {custom_count} Premium/custom emoji detected and preserved."
+            else:
+                notice = (
+                    "✅ Caption saved. No custom/premium emoji entity was detected. "
+                    "Use Telegram's Custom Emoji picker (not a normal emoji) and send it again."
+                )
+            await message.reply_text(notice, reply_markup=admin_menu())
             return
 
         # ── Photo ────────────────────────────────────────────────────────────
@@ -2215,9 +2321,15 @@ async def admin_input(
                 )
                 db.set_setting("join_msg_source_chat", str(message.chat_id))
                 db.set_setting("join_msg_source_id", str(message.message_id))
+                caption_entities = message.caption_entities or ()
                 db.set_setting(
                     "join_msg_source_entities",
-                    serialize_message_entities(message.caption_entities or ()),
+                    serialize_message_entities(caption_entities),
+                )
+                logger.info(
+                    "Saved photo caption: entities=%d custom_emoji=%d chat=%s message=%s",
+                    len(caption_entities), count_custom_emoji(caption_entities),
+                    message.chat_id, message.message_id,
                 )
             else:
                 # Clear stale source entities — this photo has no caption.
@@ -2336,10 +2448,10 @@ async def admin_input(
                     """
                     INSERT INTO channels(
                         channel_id,username,title,type,
-                        enabled,required,sort_order,
+                        enabled,required,auto_approve,sort_order,
                         created_at,updated_at
                     )
-                    VALUES(?,?,?,?,1,1,0,?,?)
+                    VALUES(?,?,?,?,1,1,0,0,?,?)
                     ON CONFLICT(channel_id) DO UPDATE SET
                         username=excluded.username,
                         title=excluded.title,
