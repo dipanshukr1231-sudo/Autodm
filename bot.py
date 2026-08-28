@@ -83,6 +83,12 @@ MAX_RETRIES = 3
 BROADCAST_DELAY = 0.08
 MAX_BUTTONS = 100
 MAX_TEXT_LENGTH = 4096
+MAX_CAPTION_LENGTH = 1024
+
+# Telegram custom emoji are message entities, not Unicode emoji.
+# The original source message is copied whenever possible; otherwise the
+# exact stored entities are sent explicitly.
+CUSTOM_EMOJI_ENTITY_TYPE = "custom_emoji"
 
 # Telegram button styles supported by Bot API / python-telegram-bot 22.7+
 # primary=blue, success=green, danger=red.
@@ -964,30 +970,39 @@ def display_name_for_user(user) -> str:
 
 
 def serialize_message_entities(entities) -> str:
-    """Serialize Telegram MessageEntity objects for persistent storage."""
+    """Serialize Telegram MessageEntity objects without losing custom emoji IDs."""
     result = []
     for entity in entities or ():
+        try:
+            entity_type = getattr(entity, "type", None)
+            offset = int(getattr(entity, "offset", 0))
+            length = int(getattr(entity, "length", 0))
+        except (TypeError, ValueError):
+            continue
+
+        if not entity_type or length <= 0:
+            continue
+
         data = {
-            "type": entity.type,
-            "offset": int(entity.offset),
-            "length": int(entity.length),
+            "type": entity_type,
+            "offset": offset,
+            "length": length,
         }
 
-        if entity.url:
-            data["url"] = entity.url
-        if entity.language:
-            data["language"] = entity.language
-        if entity.custom_emoji_id:
-            data["custom_emoji_id"] = entity.custom_emoji_id
-        if getattr(entity, "date_time_format", None):
-            data["date_time_format"] = entity.date_time_format
-        if getattr(entity, "user", None):
+        for key in ("url", "language", "custom_emoji_id", "date_time_format"):
+            value = getattr(entity, key, None)
+            if value is not None:
+                data[key] = value
+
+        # Keep mention-name users when present.
+        entity_user = getattr(entity, "user", None)
+        if entity_user is not None:
             try:
-                data["user"] = entity.user.to_dict()
+                data["user"] = entity_user.to_dict()
             except Exception:
                 pass
 
-        # DATE_TIME is uncommon, but keep its unix timestamp when available.
+        # DATE_TIME is uncommon, but preserve its timestamp if present.
         unix_time = getattr(entity, "unix_time", None)
         if unix_time is not None:
             try:
@@ -997,15 +1012,19 @@ def serialize_message_entities(entities) -> str:
 
         result.append(data)
 
-    return json.dumps(result, ensure_ascii=False)
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
 def count_custom_emoji(entities) -> int:
-    return sum(1 for e in (entities or ()) if getattr(e, "type", "") == MessageEntity.CUSTOM_EMOJI)
+    return sum(
+        1
+        for entity in (entities or ())
+        if getattr(entity, "type", "") == CUSTOM_EMOJI_ENTITY_TYPE
+    )
 
 
 def deserialize_message_entities(value: str, bot=None):
-    """Restore MessageEntity objects from stored JSON."""
+    """Restore MessageEntity objects, explicitly preserving custom_emoji_id."""
     raw = parse_json(value, [])
     if not isinstance(raw, list):
         return []
@@ -1014,29 +1033,35 @@ def deserialize_message_entities(value: str, bot=None):
     for data in raw:
         if not isinstance(data, dict):
             continue
-        item = dict(data)
 
-        # PTB can reconstruct nested User objects through de_json.
         try:
-            entities.append(MessageEntity.de_json(item, bot))
-        except Exception:
-            try:
-                allowed = {
-                    key: item[key]
-                    for key in (
-                        "type",
-                        "offset",
-                        "length",
-                        "url",
-                        "language",
-                        "custom_emoji_id",
-                        "date_time_format",
-                    )
-                    if key in item
-                }
-                entities.append(MessageEntity(**allowed))
-            except Exception:
+            entity_type = str(data.get("type", ""))
+            offset = int(data.get("offset", 0))
+            length = int(data.get("length", 0))
+            if not entity_type or length <= 0 or offset < 0:
                 continue
+
+            # Construct manually first. This is the most deterministic path
+            # for custom emoji entities across PTB versions.
+            kwargs = {
+                "type": entity_type,
+                "offset": offset,
+                "length": length,
+            }
+            for key in ("url", "language", "custom_emoji_id", "date_time_format"):
+                if data.get(key) is not None:
+                    kwargs[key] = data[key]
+
+            try:
+                entity = MessageEntity(**kwargs)
+            except TypeError:
+                # Older PTB builds may not accept newer optional fields.
+                kwargs.pop("date_time_format", None)
+                entity = MessageEntity(**kwargs)
+
+            entities.append(entity)
+        except Exception:
+            logger.exception("Could not restore message entity: %r", data)
 
     return entities
 
@@ -1163,92 +1188,81 @@ async def send_media_content(
     parse_mode: Optional[str],
     keyboard=None,
 ):
-    """Send any supported media/text while preserving Telegram entities."""
+    """Send content while preserving Telegram entities/custom emoji exactly."""
     media_type = (media_type or "none").lower()
     caption = caption or ""
     entities = list(entities or [])
 
     if media_type == "photo" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "photo": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "photo": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_photo(**kwargs)
 
     if media_type == "video" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "video": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "video": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_video(**kwargs)
 
     if media_type == "document" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "document": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "document": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_document(**kwargs)
 
     if media_type == "animation" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "animation": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "animation": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_animation(**kwargs)
 
     if media_type == "audio" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "audio": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "audio": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_audio(**kwargs)
 
     if media_type == "voice" and file_id:
-        kwargs = {
-            "chat_id": chat_id,
-            "voice": file_id,
-            "caption": caption[:1024] or None,
-            "reply_markup": keyboard,
-        }
-        if entities:
-            kwargs["caption_entities"] = entities
-        elif parse_mode:
-            kwargs["parse_mode"] = parse_mode
+        kwargs = {"chat_id": chat_id, "voice": file_id, "reply_markup": keyboard}
+        if caption:
+            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
+            if entities:
+                kwargs["caption_entities"] = entities
+            elif parse_mode:
+                kwargs["parse_mode"] = parse_mode
         return await bot.send_voice(**kwargs)
+
+    # Text messages MUST contain actual text. The previous implementation
+    # used a single space as a fallback, which caused Telegram's
+    # "Text must be non-empty" error shown in the screenshot.
+    text = caption[:MAX_TEXT_LENGTH].strip("\u0000")
+    if not text.strip():
+        raise ValueError("Text must be non-empty. Add text/caption before previewing or broadcasting.")
 
     kwargs = {
         "chat_id": chat_id,
-        "text": (caption or " ")[:MAX_TEXT_LENGTH],
+        "text": text,
         "reply_markup": keyboard,
         "disable_web_page_preview": True,
     }
@@ -1314,6 +1328,8 @@ async def send_configured_message(bot, chat_id: int, user=None):
                         clean_error(copy_exc)[:500],
                     )
 
+            # Explicit-entity path. When a template is used we cannot copy the
+            # original message because {Username} must be rendered first.
             return await send_media_content(
                 bot,
                 chat_id,
@@ -2270,6 +2286,22 @@ async def admin_callback(
             await query.message.reply_text("🗑 Broadcast buttons cleared.", reply_markup=broadcast_draft_keyboard())
             return
 
+        if data == "broadcast_preview":
+            broadcast_id = context.user_data.get("pending_broadcast_id")
+            if not broadcast_id:
+                await query.message.reply_text("No pending broadcast draft.")
+                return
+            try:
+                row = db.fetchone("SELECT * FROM broadcasts WHERE id=? AND status='pending'", (broadcast_id,))
+                if not row:
+                    await query.message.reply_text("Broadcast draft not found.")
+                    return
+                await send_broadcast_to_user(context.bot, row, query.from_user.id)
+                await query.message.reply_text("👁 Broadcast preview sent.", reply_markup=broadcast_draft_keyboard())
+            except Exception as exc:
+                await query.message.reply_text(f"Preview failed: {clean_error(exc)[:700]}", reply_markup=broadcast_draft_keyboard())
+            return
+
         if data == "broadcast_send":
             broadcast_id = context.user_data.get("pending_broadcast_id")
             if not broadcast_id:
@@ -2390,7 +2422,7 @@ async def admin_input(
                 commit=True,
             )
 
-            entities = message.entities or message.caption_entities or ()
+            entities = (message.entities if message.text is not None else message.caption_entities) or ()
             db.set_setting("join_msg_source_entities", serialize_message_entities(entities))
 
             # A separately supplied caption is NOT an exact copy of the media
@@ -2439,8 +2471,8 @@ async def admin_input(
                 )
                 return
 
-            if len(caption) > 1024:
-                await message.reply_text("Media caption is too long. Telegram allows up to 1024 characters.")
+            if len(caption) > MAX_CAPTION_LENGTH:
+                await message.reply_text(f"Media caption is too long. Telegram allows up to {MAX_CAPTION_LENGTH} characters.")
                 return
 
             join_msg = db.get_join_message()
@@ -2677,7 +2709,10 @@ def broadcast_draft_keyboard():
         [
             [_make_callback_button("➕ Add Button", "broadcast_add_button", "success")],
             [
+                _make_callback_button("👁 Preview", "broadcast_preview", "primary"),
                 _make_callback_button("🚀 Send Now", "broadcast_send", "success"),
+            ],
+            [
                 _make_callback_button("🗑 Clear Buttons", "broadcast_clear_buttons", "danger"),
             ],
             [_make_callback_button("⬅️ Broadcast Center", "admin_broadcast", "primary")],
@@ -2839,7 +2874,7 @@ async def send_broadcast_to_user(bot, row, user_id: int):
         user_id,
         row["media_type"] or "none",
         row["file_id"] or "",
-        row["caption"] if row["media_type"] != "none" else (row["text"] or row["caption"] or " "),
+        row["caption"] if row["media_type"] != "none" else (row["text"] or row["caption"] or ""),
         entities,
         row["parse_mode"] or None,
         keyboard,
@@ -2896,8 +2931,27 @@ async def run_broadcast(application: Application, broadcast_id: int):
                     failed += 1
                     status, error = "failed", clean_error(retry_exc)
             except (NetworkError, TimedOut) as exc:
-                failed += 1
-                status, error = "failed", clean_error(exc)
+                retry_ok = False
+                last_error = exc
+                for retry_index in range(2):
+                    try:
+                        await asyncio.sleep(2 ** retry_index)
+                        await send_broadcast_to_user(application.bot, row, user_id)
+                        sent += 1
+                        status, error = "sent", None
+                        retry_ok = True
+                        break
+                    except Forbidden as retry_exc:
+                        blocked += 1
+                        status, error = "blocked", clean_error(retry_exc)
+                        db.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (user_id,), commit=True)
+                        retry_ok = True
+                        break
+                    except Exception as retry_exc:
+                        last_error = retry_exc
+                if not retry_ok:
+                    failed += 1
+                    status, error = "failed", clean_error(last_error)
             except Exception as exc:
                 failed += 1
                 status, error = "failed", clean_error(exc)
@@ -3137,6 +3191,10 @@ async def post_init(application: Application):
 
         me = await application.bot.get_me()
         logger.info("Connected as @%s (%s)", me.username, me.id)
+        logger.info(
+            "Custom emoji support uses Telegram MessageEntity(custom_emoji); "
+            "bot-owner Premium is required by Bot API for direct custom emoji sending."
+        )
 
         # Only /start in the menu — clean, no extra commands shown to users
         await application.bot.set_my_commands(
