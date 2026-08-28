@@ -90,9 +90,33 @@ MAX_CAPTION_LENGTH = 1024
 # exact stored entities are sent explicitly.
 CUSTOM_EMOJI_ENTITY_TYPE = "custom_emoji"
 
-# Telegram button styles supported by Bot API / python-telegram-bot 22.7+
-# primary=blue, success=green, danger=red.
+# IMPORTANT — REAL BOT API LIMIT (read before touching buttons):
+# Telegram's InlineKeyboardButton has no "style"/color field and no
+# "icon_custom_emoji_id" field. Buttons cannot be colored and cannot carry a
+# premium-emoji icon — that is not a Bot API capability, on any client or
+# any python-telegram-bot version. The previous build called
+# InlineKeyboardButton(style=..., icon_custom_emoji_id=...), which raises
+# TypeError the moment a non-default style or an icon was used. That crash
+# is what broke preview/broadcast rendering.
+#
+# "style" is kept here ONLY as an internal label so a leading emoji
+# (🔵/🟢/🔴) can be prefixed onto the button TEXT for a visual hint in the
+# admin's own menus. It is stripped before the real InlineKeyboardButton is
+# built. icon_custom_emoji_id is still stored (harmless) but never sent to
+# Telegram on a button, since Telegram would reject it.
 BUTTON_STYLES = ("primary", "success", "danger")
+BUTTON_STYLE_PREFIX = {
+    "primary": "🔵",
+    "success": "🟢",
+    "danger": "🔴",
+}
+
+# Premium/custom emoji ARE fully supported — but only inside message TEXT or
+# a media CAPTION, as a MessageEntity(type="custom_emoji", custom_emoji_id=...).
+# They must be sent as bot.send_message(..., entities=[...]) /
+# send_photo(..., caption_entities=[...]), or via bot.copy_message() which
+# carries the original entities untouched. That is what send_media_content()
+# and send_configured_message() below do.
 
 logging.basicConfig(
     level=logging.INFO,
@@ -792,21 +816,36 @@ def is_owner(user_id: Optional[int]) -> bool:
 # KEYBOARDS
 # ============================================================
 
+def _styled_label(text: str, style: Optional[str]) -> str:
+    """Prefix a small colored-dot emoji onto the button's visible text.
+
+    This is the closest real equivalent to a "colored button" that Telegram
+    actually supports: the label itself can start with 🔵/🟢/🔴. The button
+    object sent to Telegram never receives a style field, because none
+    exists on InlineKeyboardButton.
+    """
+    prefix = BUTTON_STYLE_PREFIX.get(normalize_button_style(style), "")
+    text = text.strip()
+    if prefix and not text.startswith(prefix):
+        return f"{prefix} {text}"[:64]
+    return text[:64]
+
+
 def _make_inline_button(
     text: str,
     url: str,
     style: Optional[str] = None,
     icon_custom_emoji_id: Optional[str] = None,
 ) -> InlineKeyboardButton:
-    """Create a styled URL button using current Bot API fields."""
-    kwargs = {
-        "text": text[:64],
-        "url": url,
-        "style": normalize_button_style(style),
-    }
-    if icon_custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-    return InlineKeyboardButton(**kwargs)
+    """Create a real Telegram URL button.
+
+    style/icon_custom_emoji_id are accepted for backward compatibility with
+    every existing call site and DB row, but only `style` has a visible
+    effect (a colored-dot prefix on the label). Telegram does not support
+    button colors or button emoji icons, so neither field is ever passed
+    into InlineKeyboardButton itself.
+    """
+    return InlineKeyboardButton(text=_styled_label(text, style), url=url)
 
 
 def _make_callback_button(
@@ -815,15 +854,10 @@ def _make_callback_button(
     style: Optional[str] = None,
     icon_custom_emoji_id: Optional[str] = None,
 ) -> InlineKeyboardButton:
-    """Create a styled callback button."""
-    kwargs = {
-        "text": text[:64],
-        "callback_data": callback_data,
-        "style": normalize_button_style(style),
-    }
-    if icon_custom_emoji_id:
-        kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-    return InlineKeyboardButton(**kwargs)
+    """Create a real Telegram callback button. See _make_inline_button."""
+    return InlineKeyboardButton(
+        text=_styled_label(text, style), callback_data=callback_data
+    )
 
 
 def build_keyboard(buttons):
@@ -1070,6 +1104,45 @@ def _utf16_len(value: str) -> int:
     return len(value.encode("utf-16-le")) // 2
 
 
+def truncate_with_entities(text: str, entities, max_len: int):
+    """Truncate text to max_len UTF-16 code units, dropping/clipping entities
+    that would otherwise be cut in half or point past the new end.
+
+    Plain Python slicing (text[:max_len]) cuts by code point, not UTF-16 code
+    unit. Telegram entity offsets are always UTF-16 code units, so a plain
+    slice can land in the middle of a surrogate pair or leave stored
+    custom_emoji entities pointing past the truncated text — Telegram then
+    silently ignores those entities and the message renders with plain
+    emoji/text instead of premium emoji. This keeps both in sync.
+    """
+    entities = list(entities or [])
+    if _utf16_len(text) <= max_len:
+        return text, entities
+
+    # Walk code points, tracking UTF-16 length, to find a safe cut point.
+    utf16_count = 0
+    cut_index = len(text)
+    for i, ch in enumerate(text):
+        ch_len = 2 if ord(ch) > 0xFFFF else 1
+        if utf16_count + ch_len > max_len:
+            cut_index = i
+            break
+        utf16_count += ch_len
+    truncated = text[:cut_index]
+    new_len = _utf16_len(truncated)
+
+    kept = []
+    for entity in entities:
+        start = int(entity.offset)
+        end = start + int(entity.length)
+        if end <= new_len:
+            kept.append(entity)
+        # Entities that straddle or fall after the cut are dropped rather
+        # than sent malformed — a missing trailing emoji beats a rejected
+        # message or a broken entity list.
+    return truncated, kept
+
+
 def render_template_with_entities(text: str, entities, user):
     """Replace {Username} placeholders while keeping Telegram entities aligned.
 
@@ -1188,75 +1261,44 @@ async def send_media_content(
     parse_mode: Optional[str],
     keyboard=None,
 ):
-    """Send content while preserving Telegram entities/custom emoji exactly."""
+    """Send content while preserving Telegram entities/custom emoji exactly.
+
+    Truncation is done in UTF-16 code units via truncate_with_entities() so
+    that a long caption/text never desyncs custom_emoji entity offsets —
+    that desync was the main cause of premium emoji silently falling back
+    to plain emoji/text on longer messages.
+    """
     media_type = (media_type or "none").lower()
     caption = caption or ""
     entities = list(entities or [])
 
-    if media_type == "photo" and file_id:
-        kwargs = {"chat_id": chat_id, "photo": file_id, "reply_markup": keyboard}
+    media_senders = {
+        "photo": bot.send_photo,
+        "video": bot.send_video,
+        "document": bot.send_document,
+        "animation": bot.send_animation,
+        "audio": bot.send_audio,
+        "voice": bot.send_voice,
+    }
+
+    if media_type in media_senders and file_id:
+        kwargs = {"chat_id": chat_id, media_type: file_id, "reply_markup": keyboard}
         if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
+            safe_caption, safe_entities = truncate_with_entities(
+                caption, entities, MAX_CAPTION_LENGTH
+            )
+            kwargs["caption"] = safe_caption
+            if safe_entities:
+                kwargs["caption_entities"] = safe_entities
             elif parse_mode:
                 kwargs["parse_mode"] = parse_mode
-        return await bot.send_photo(**kwargs)
+        return await media_senders[media_type](**kwargs)
 
-    if media_type == "video" and file_id:
-        kwargs = {"chat_id": chat_id, "video": file_id, "reply_markup": keyboard}
-        if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
-            elif parse_mode:
-                kwargs["parse_mode"] = parse_mode
-        return await bot.send_video(**kwargs)
-
-    if media_type == "document" and file_id:
-        kwargs = {"chat_id": chat_id, "document": file_id, "reply_markup": keyboard}
-        if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
-            elif parse_mode:
-                kwargs["parse_mode"] = parse_mode
-        return await bot.send_document(**kwargs)
-
-    if media_type == "animation" and file_id:
-        kwargs = {"chat_id": chat_id, "animation": file_id, "reply_markup": keyboard}
-        if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
-            elif parse_mode:
-                kwargs["parse_mode"] = parse_mode
-        return await bot.send_animation(**kwargs)
-
-    if media_type == "audio" and file_id:
-        kwargs = {"chat_id": chat_id, "audio": file_id, "reply_markup": keyboard}
-        if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
-            elif parse_mode:
-                kwargs["parse_mode"] = parse_mode
-        return await bot.send_audio(**kwargs)
-
-    if media_type == "voice" and file_id:
-        kwargs = {"chat_id": chat_id, "voice": file_id, "reply_markup": keyboard}
-        if caption:
-            kwargs["caption"] = caption[:MAX_CAPTION_LENGTH]
-            if entities:
-                kwargs["caption_entities"] = entities
-            elif parse_mode:
-                kwargs["parse_mode"] = parse_mode
-        return await bot.send_voice(**kwargs)
-
-    # Text messages MUST contain actual text. The previous implementation
-    # used a single space as a fallback, which caused Telegram's
-    # "Text must be non-empty" error shown in the screenshot.
-    text = caption[:MAX_TEXT_LENGTH].strip("\u0000")
+    # Text messages MUST contain actual text. A single space as a fallback
+    # causes Telegram's "Text must be non-empty" error.
+    text, text_entities = truncate_with_entities(
+        caption.strip("\u0000"), entities, MAX_TEXT_LENGTH
+    )
     if not text.strip():
         raise ValueError("Text must be non-empty. Add text/caption before previewing or broadcasting.")
 
@@ -1266,8 +1308,8 @@ async def send_media_content(
         "reply_markup": keyboard,
         "disable_web_page_preview": True,
     }
-    if entities:
-        kwargs["entities"] = entities
+    if text_entities:
+        kwargs["entities"] = text_entities
     elif parse_mode:
         kwargs["parse_mode"] = parse_mode
     return await bot.send_message(**kwargs)
@@ -1568,7 +1610,7 @@ async def show_dashboard(query):
         f"📦 Size: {db_size:,} bytes"
     )
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         text,
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1589,7 +1631,7 @@ async def show_statistics(query):
     total = s["sent"] + s["failed"]
     success_rate = (s["sent"] / total) * 100 if total else 0
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         (
             "📈 STATISTICS\n\n"
             f"Users: {s['users']}\n"
@@ -1611,7 +1653,7 @@ async def show_settings(query):
     check = db.get_setting("check_join_enabled", "0")
     style = db.get_setting("start_button_style", "primary")
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         (
             "⚙️ BOT SETTINGS\n\n"
             f"Bot Name: {db.get_setting('bot_name','Join Request Bot')}\n"
@@ -1643,7 +1685,7 @@ async def show_settings(query):
 async def show_join_settings(query):
     enabled = db.get_setting("auto_message_enabled", "1")
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         (
             "📩 JOIN REQUEST SETTINGS\n\n"
             f"Auto Message: {'ON' if enabled == '1' else 'OFF'}\n\n"
@@ -1677,7 +1719,7 @@ async def show_message_builder(query):
         btn_lines.append(f"  [{style}]{icon} {b['text']} → {b['url']}")
     btn_preview = "\n".join(btn_lines) if btn_lines else "None"
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         (
             "💬 MESSAGE BUILDER\n\n"
             f"Media: {media}\n"
@@ -1773,7 +1815,7 @@ async def show_channels(query):
         ]
     )
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "\n".join(lines)[:4000],
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -1809,7 +1851,7 @@ async def show_users(query):
         )
         lines.append(f"• {name} — {row['user_id']}")
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "\n".join(lines)[:4000],
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1846,7 +1888,7 @@ async def show_broadcast_menu(query):
     else:
         lines.append("No broadcasts yet.")
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "\n".join(lines)[:4000],
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1883,7 +1925,7 @@ async def show_backup_menu(query):
         "\n📥 To restore: send the backup .db file here."
     )
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "\n".join(lines)[:4000],
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1899,7 +1941,7 @@ async def show_backup_menu(query):
 
 
 async def show_export_menu(query):
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "📤 DATABASE EXPORT",
         reply_markup=InlineKeyboardMarkup(
             [
@@ -1946,7 +1988,7 @@ async def show_logs(query):
 
         text = "\n".join(parts)
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         text[:4000],
         reply_markup=back_keyboard(),
     )
@@ -1969,7 +2011,7 @@ async def show_admins(query):
 
     lines.append("\nOwner is controlled by OWNER_ID.")
 
-    await query.edit_message_text(
+    await safe_edit_message(query,
         "\n".join(lines)[:4000],
         reply_markup=back_keyboard(),
     )
@@ -2003,7 +2045,7 @@ async def admin_callback(
         await query.answer()
 
         if data == "admin_home":
-            await query.edit_message_text(
+            await safe_edit_message(query,
                 "🔐 Admin Panel",
                 reply_markup=admin_menu(),
             )
@@ -2353,6 +2395,29 @@ async def answer_query(query, text="", show_alert=False):
         await query.answer(text=text[:200], show_alert=show_alert)
     except TelegramError:
         pass
+
+
+async def safe_edit_message(query, text, reply_markup=None, parse_mode=None):
+    """edit_message_text that treats 'Message is not modified' as success.
+
+    Telegram raises BadRequest("Message is not modified") whenever the new
+    text+markup are byte-identical to what is already on screen — e.g. an
+    admin taps "Refresh" on the dashboard twice within the same second, or
+    navigates back to a menu that hasn't changed. That is not a real error,
+    but it was previously falling through to the generic exception handler
+    in admin_callback and showing "⚠️ Operation failed safely" even though
+    nothing failed. Every admin-menu edit_message_text call goes through
+    this helper instead of calling query.edit_message_text directly.
+    """
+    kwargs = {"reply_markup": reply_markup}
+    if parse_mode:
+        kwargs["parse_mode"] = parse_mode
+    try:
+        return await query.edit_message_text(text, **kwargs)
+    except BadRequest as exc:
+        if "message is not modified" in str(exc).lower():
+            return None
+        raise
 
 
 # ============================================================
@@ -3033,13 +3098,24 @@ async def create_backup(query):
             commit=True,
         )
 
+        # Snapshot counts so the admin can see at a glance what this backup
+        # contains, without opening the .db file.
+        user_count = db.fetchone("SELECT COUNT(*) AS c FROM users")["c"]
+        channel_count = db.fetchone("SELECT COUNT(*) AS c FROM channels")["c"]
+        admin_count = db.fetchone("SELECT COUNT(*) AS c FROM admins")["c"]
+        join_req_count = db.fetchone("SELECT COUNT(*) AS c FROM join_requests")["c"]
+
         with destination.open("rb") as file:
             await query.message.reply_document(
                 document=InputFile(file, filename=filename),
                 caption=(
                     "💾 Backup created successfully.\n"
                     f"Size: {size:,} bytes\n\n"
-                    "To restore: send this .db file to me."
+                    f"👥 Users: {user_count:,}\n"
+                    f"📢 Channels: {channel_count:,}\n"
+                    f"📩 Join requests: {join_req_count:,}\n"
+                    f"🔐 Admins: {admin_count:,}\n\n"
+                    "To restore: send this .db file back to me."
                 ),
             )
 
