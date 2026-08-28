@@ -6,8 +6,11 @@ import logging
 import os
 import re
 import shutil
+import signal
 import sqlite3
+import threading
 from datetime import datetime, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Optional
 
@@ -2980,7 +2983,4 @@ async def create_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         text = message.text or ""
         caption = text
-        source_entities = message.entities or ()
-
-    content = caption if media_type != "none" else text
- 
+        source_en
