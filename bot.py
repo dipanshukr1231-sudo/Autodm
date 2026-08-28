@@ -2089,12 +2089,11 @@ async def admin_callback(
         if data == "set_backup_channel":
             context.user_data["awaiting"] = "backup_channel"
             await query.message.reply_text(
-                "Send the PUBLIC backup/log channel username or link.\n\n"
-                "Examples:\n"
-                "@MyBackupChannel\n"
-                "https://t.me/MyBackupChannel\n\n"
-                "The bot must already be an administrator in that channel "
-                "with permission to post messages.\n\n"
+                "Send the backup channel ID, @username, or link.\n\n"
+                "Private channel: send its numeric ID (for example -1001234567890).\n"
+                "Public channel: @MyBackupChannel or https://t.me/MyBackupChannel\n\n"
+                "The bot must already be an administrator with permission to post messages.\n"
+                "Private backup channels are kept hidden from normal users.\n\n"
                 "Use /cancel to cancel."
             )
             return
@@ -2441,6 +2440,43 @@ async def test_message(
 
 
 # ============================================================
+# USER MESSAGE -> CONFIGURED JOIN MESSAGE
+# ============================================================
+
+async def handle_user_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Send the configured join message/button when a normal user starts or types."""
+    user = update.effective_user
+    message = update.message
+    if not user or not message or is_admin(user.id):
+        return
+
+    # /start is handled by the dedicated start handler so it keeps the configured
+    # welcome text. For every other private user message, send the same configured
+    # join message with the admin-configured join button(s).
+    try:
+        db.upsert_user(user)
+        if db.get_setting("maintenance_mode", "0") == "1":
+            return
+        await send_configured_message(context.bot, user.id, user)
+    except Forbidden:
+        db.execute("UPDATE users SET is_blocked=1 WHERE user_id=?", (user.id,), commit=True)
+    except Exception as exc:
+        logger.exception("User message handler failed")
+        db.log_error("ERROR", "user_message", "send_configured", repr(exc))
+
+
+async def private_message_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Route private non-command messages to admin flow or normal-user flow."""
+    user = update.effective_user
+    if not user:
+        return
+    if is_admin(user.id):
+        await admin_input(update, context)
+    else:
+        await handle_user_message(update, context)
+
+
+# ============================================================
 # ADMIN INPUT
 # ============================================================
 
@@ -2634,17 +2670,25 @@ async def admin_input(
 
         if state == "backup_channel":
             raw = (message.text or "").strip()
+            if not raw:
+                await message.reply_text(
+                    "Send the private/public backup channel ID, @username, or t.me link."
+                )
+                return
+
+            # Private channels normally have no @username.  The owner can use
+            # the numeric chat ID (for example -1001234567890). Public channels
+            # can still be configured by @username or t.me link.
             if raw.startswith("@"):
                 lookup = raw
             elif "t.me/" in raw:
                 tail = raw.split("t.me/", 1)[1].split("/", 1)[0].strip()
                 lookup = f"@{tail}"
             else:
-                lookup = raw
-
-            if not lookup:
-                await message.reply_text("Send a valid public channel @username or t.me link.")
-                return
+                try:
+                    lookup = int(raw)
+                except ValueError:
+                    lookup = f"@{raw.lstrip('@')}"
 
             try:
                 chat = await context.bot.get_chat(lookup)
@@ -2660,8 +2704,6 @@ async def admin_input(
                     )
                     return
 
-                # Telegram channel admins normally have this attribute; if it is
-                # explicitly false, the bot cannot publish backup files.
                 can_post = getattr(member, "can_post_messages", None)
                 if can_post is False:
                     await message.reply_text(
@@ -2669,13 +2711,9 @@ async def admin_input(
                     )
                     return
 
+                # Do not require a username: this intentionally supports private
+                # backup vault channels. Username is stored only if Telegram has one.
                 username = getattr(chat, "username", None) or ""
-                if not username:
-                    await message.reply_text(
-                        "For this feature, please use a PUBLIC channel with an @username."
-                    )
-                    return
-
                 db.set_setting("backup_channel_id", str(chat.id))
                 db.set_setting("backup_channel_username", username)
                 db.set_setting("backup_channel_title", chat.title or "")
@@ -2683,10 +2721,10 @@ async def admin_input(
                 context.user_data.pop("awaiting", None)
 
                 await message.reply_text(
-                    "✅ Backup channel configured.\n\n"
-                    f"📢 {chat.title or '-'}\n"
-                    f"🆔 {chat.id}\n"
-                    f"🔗 @{username}\n\n"
+                    "✅ Private backup channel configured.\n\n"
+                    f"📢 {chat.title or 'Private Backup Vault'}\n"
+                    f"🆔 {chat.id}\n\n"
+                    "🔒 This backup channel is admin-only and is never shown to normal users.\n"
                     "☁️ Automatic full backup is now ON.\n"
                     "⏱ A new backup will be uploaded every 1 minute.",
                     reply_markup=admin_menu(),
@@ -3668,6 +3706,8 @@ def build_application() -> Application:
     )
     application.add_handler(CallbackQueryHandler(admin_callback))
 
+    # One private-message router keeps admin workflows working while normal
+    # users receive the configured join message/button on any message.
     application.add_handler(
         MessageHandler(
             (
@@ -3683,7 +3723,7 @@ def build_application() -> Application:
                 )
                 & ~filters.COMMAND
             ),
-            admin_input,
+            private_message_router,
         )
     )
 
