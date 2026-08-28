@@ -85,6 +85,11 @@ MAX_BUTTONS = 100
 MAX_TEXT_LENGTH = 4096
 MAX_CAPTION_LENGTH = 1024
 
+# Automatic disaster-recovery backup interval. Backups are sent to the
+# configured Telegram backup/log channel, so they survive Render disk resets.
+AUTO_BACKUP_INTERVAL_SECONDS = 60
+AUTO_BACKUP_LOCAL_RETENTION = 10
+
 # Telegram custom emoji are message entities, not Unicode emoji.
 # The original source message is copied whenever possible; otherwise the
 # exact stored entities are sent explicitly.
@@ -428,6 +433,12 @@ class Database:
             "check_join_enabled": "0",
             "bot_name": "Join Request Bot",
             "join_msg_source_entities": "[]",
+            # Public/private Telegram channel used as an off-server backup vault.
+            "backup_channel_id": "",
+            "backup_channel_username": "",
+            "backup_channel_title": "",
+            "backup_channel_enabled": "0",
+            "join_msg_source_entities": "[]",
         }
 
         for key, value in defaults.items():
@@ -749,6 +760,8 @@ class Database:
 db = Database(DB_PATH)
 db.connect()
 
+AUTO_BACKUP_TASK = None
+
 
 # ============================================================
 # ACCESS CONTROL
@@ -922,6 +935,9 @@ def admin_menu():
             [
                 _make_callback_button("💾 Backup", "admin_backup", "primary"),
                 _make_callback_button("📤 Export", "admin_export", "primary"),
+            ],
+            [
+                _make_callback_button("☁️ Backup Channel", "admin_backup_channel", "primary"),
             ],
             [
                 _make_callback_button("🧪 Test Message", "admin_test", "success"),
@@ -1867,9 +1883,33 @@ async def show_backup_menu(query):
         """
     )
 
+    channel_id = db.get_setting("backup_channel_id", "")
+    channel_title = db.get_setting("backup_channel_title", "")
+    channel_username = db.get_setting("backup_channel_username", "")
+    channel_enabled = db.get_setting("backup_channel_enabled", "0") == "1"
+
     lines = ["💾 BACKUP\n"]
 
+    if channel_enabled and channel_id:
+        channel_line = channel_title or channel_id
+        if channel_username:
+            channel_line += f" (@{channel_username})"
+        lines.extend([
+            "☁️ Auto Backup: ON",
+            f"📢 Backup Channel: {channel_line}",
+            f"🆔 ID: {channel_id}",
+            "⏱ Interval: 1 minute",
+            "",
+        ])
+    else:
+        lines.extend([
+            "☁️ Auto Backup: OFF",
+            "📢 Backup Channel: Not configured",
+            "",
+        ])
+
     if backups:
+        lines.append("Recent local backups:")
         for row in backups:
             lines.append(
                 f"• {row['filename']}\n"
@@ -1877,24 +1917,21 @@ async def show_backup_menu(query):
                 f"  {row['created_at']}"
             )
     else:
-        lines.append("No backups yet.")
+        lines.append("No local backups yet.")
 
     lines.append(
-        "\n📥 To restore: send the backup .db file here."
+        "\n📥 RESTORE: Send a .db/.sqlite/.sqlite3 backup file directly here."
     )
+
+    rows = [
+        [_make_callback_button("💾 Create Backup", "backup_create", "success")],
+        [_make_callback_button("☁️ Backup Channel Settings", "admin_backup_channel", "primary")],
+        [_make_callback_button("⬅️ Back", "admin_home", "primary")],
+    ]
 
     await query.edit_message_text(
         "\n".join(lines)[:4000],
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [
-                    _make_callback_button("💾 Create Backup", "backup_create", "success")
-                ],
-                [
-                    _make_callback_button("⬅️ Back", "admin_home", "primary")
-                ],
-            ]
-        ),
+        reply_markup=InlineKeyboardMarkup(rows),
     )
 
 
@@ -2043,6 +2080,28 @@ async def admin_callback(
 
         if data == "admin_backup":
             await show_backup_menu(query)
+            return
+
+        if data == "admin_backup_channel":
+            await show_backup_channel(query)
+            return
+
+        if data == "set_backup_channel":
+            context.user_data["awaiting"] = "backup_channel"
+            await query.message.reply_text(
+                "Send the PUBLIC backup/log channel username or link.\n\n"
+                "Examples:\n"
+                "@MyBackupChannel\n"
+                "https://t.me/MyBackupChannel\n\n"
+                "The bot must already be an administrator in that channel "
+                "with permission to post messages.\n\n"
+                "Use /cancel to cancel."
+            )
+            return
+
+        if data == "disable_backup_channel":
+            db.set_setting("backup_channel_enabled", "0")
+            await show_backup_channel(query)
             return
 
         if data == "admin_export":
@@ -2398,7 +2457,11 @@ async def admin_input(
     state = context.user_data.get("awaiting")
 
     # Owner-only backup restore.
-    if message.document and message.document.file_name and message.document.file_name.lower().endswith(".db"):
+    if (
+        message.document
+        and message.document.file_name
+        and Path(message.document.file_name).suffix.lower() in {".db", ".sqlite", ".sqlite3"}
+    ):
         if is_owner(user.id):
             await restore_backup_from_document(message, context)
         else:
@@ -2567,6 +2630,85 @@ async def admin_input(
                 "Broadcast draft is ready. Use the buttons below to add buttons or send it.",
                 reply_markup=broadcast_draft_keyboard(),
             )
+            return
+
+        if state == "backup_channel":
+            raw = (message.text or "").strip()
+            if raw.startswith("@"):
+                lookup = raw
+            elif "t.me/" in raw:
+                tail = raw.split("t.me/", 1)[1].split("/", 1)[0].strip()
+                lookup = f"@{tail}"
+            else:
+                lookup = raw
+
+            if not lookup:
+                await message.reply_text("Send a valid public channel @username or t.me link.")
+                return
+
+            try:
+                chat = await context.bot.get_chat(lookup)
+                if chat.type != "channel":
+                    await message.reply_text("That is not a Telegram channel.")
+                    return
+
+                member = await context.bot.get_chat_member(chat.id, context.bot.id)
+                status = str(getattr(member, "status", ""))
+                if status not in ("administrator", "creator"):
+                    await message.reply_text(
+                        "❌ Bot is not an administrator in this channel."
+                    )
+                    return
+
+                # Telegram channel admins normally have this attribute; if it is
+                # explicitly false, the bot cannot publish backup files.
+                can_post = getattr(member, "can_post_messages", None)
+                if can_post is False:
+                    await message.reply_text(
+                        "❌ Bot is admin, but it does not have permission to post messages."
+                    )
+                    return
+
+                username = getattr(chat, "username", None) or ""
+                if not username:
+                    await message.reply_text(
+                        "For this feature, please use a PUBLIC channel with an @username."
+                    )
+                    return
+
+                db.set_setting("backup_channel_id", str(chat.id))
+                db.set_setting("backup_channel_username", username)
+                db.set_setting("backup_channel_title", chat.title or "")
+                db.set_setting("backup_channel_enabled", "1")
+                context.user_data.pop("awaiting", None)
+
+                await message.reply_text(
+                    "✅ Backup channel configured.\n\n"
+                    f"📢 {chat.title or '-'}\n"
+                    f"🆔 {chat.id}\n"
+                    f"🔗 @{username}\n\n"
+                    "☁️ Automatic full backup is now ON.\n"
+                    "⏱ A new backup will be uploaded every 1 minute.",
+                    reply_markup=admin_menu(),
+                )
+
+                # Test the exact publishing path immediately so a wrong
+                # permission is discovered before the first scheduled backup.
+                try:
+                    await message.reply_text("🧪 Sending a test backup to the channel...")
+                    await automatic_backup_once(context.bot)
+                    await message.reply_text("✅ Test backup uploaded successfully.")
+                except Exception as exc:
+                    db.log_error("ERROR", "backup", "channel_test", repr(exc))
+                    await message.reply_text(
+                        "⚠️ Channel saved, but the test upload failed:\n"
+                        f"{clean_error(exc)[:500]}\n\n"
+                        "Check that the bot can post in the channel."
+                    )
+            except TelegramError as exc:
+                await message.reply_text(
+                    f"❌ Could not access the backup channel:\n{clean_error(exc)[:700]}"
+                )
             return
 
         if state == "channel":
@@ -2996,32 +3138,69 @@ async def run_broadcast(application: Application, broadcast_id: int):
 
 
 # ============================================================
-# BACKUP
+# BACKUP / DISASTER RECOVERY
 # ============================================================
 
-async def create_backup(query):
+def backup_channel_id() -> Optional[int]:
+    """Return the configured Telegram backup channel ID, if enabled."""
+    if db.get_setting("backup_channel_enabled", "0") != "1":
+        return None
+    raw = db.get_setting("backup_channel_id", "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def prune_local_backups() -> None:
+    """Keep only a small local rolling set; Telegram channel is the durable vault."""
+    try:
+        files = sorted(
+            (
+                f for f in BACKUP_DIR.glob("backup_*.db")
+                if f.is_file()
+            ),
+            key=lambda f: f.stat().st_mtime,
+            reverse=True,
+        )
+        for old_file in files[AUTO_BACKUP_LOCAL_RETENTION:]:
+            try:
+                old_file.unlink()
+            except OSError:
+                logger.warning("Could not prune local backup: %s", old_file)
+    except Exception:
+        logger.exception("Local backup pruning failed")
+
+
+def create_backup_file(created_by: Optional[int] = None):
+    """
+    Create a consistent SQLite backup containing ALL persisted bot state:
+    users, admins, channels, bot_settings, messages, buttons, join requests,
+    broadcasts, broadcast logs, events, errors and backup metadata.
+    """
     if not DB_PATH.exists():
-        await query.message.reply_text("Database file does not exist.")
-        return
+        raise FileNotFoundError("Database file does not exist.")
 
     filename = (
         "backup_"
-        + datetime.now().strftime("%Y_%m_%d_%H%M%S")
+        + datetime.now(timezone.utc).strftime("%Y_%m_%d_%H%M%S_%f")
         + ".db"
     )
-
     destination = BACKUP_DIR / filename
+
     source = None
     target = None
-
     try:
+        # SQLite's backup API gives us a consistent snapshot even while the bot
+        # is receiving join requests or writing settings.
         source = sqlite3.connect(str(DB_PATH), timeout=30)
         target = sqlite3.connect(str(destination), timeout=30)
         source.backup(target)
         target.commit()
 
         integrity = target.execute("PRAGMA integrity_check").fetchone()[0]
-
         if integrity != "ok":
             raise RuntimeError(f"Backup integrity check failed: {integrity}")
 
@@ -3029,10 +3208,57 @@ async def create_backup(query):
 
         db.execute(
             "INSERT INTO backups(filename,created_at,created_by,size) VALUES(?,?,?,?)",
-            (filename, utc_now(), query.from_user.id, size),
+            (filename, utc_now(), created_by, size),
             commit=True,
         )
 
+        prune_local_backups()
+        return destination, filename, size
+
+    finally:
+        if source:
+            source.close()
+        if target:
+            target.close()
+
+
+async def send_backup_to_channel(bot, destination: Path, filename: str, size: int, automatic: bool):
+    """Upload a backup file to the configured Telegram backup channel."""
+    channel_id = backup_channel_id()
+    if not channel_id:
+        return False
+
+    caption = (
+        "🔐 AUTOMATIC BOT BACKUP\n" if automatic else "💾 MANUAL BOT BACKUP\n"
+    )
+    caption += (
+        f"📁 {filename}\n"
+        f"📦 Size: {size:,} bytes\n"
+        f"🕐 UTC: {utc_now()}\n\n"
+        "This .db file contains the bot's persisted database state and can be "
+        "uploaded to the bot by the owner to restore it."
+    )
+
+    with destination.open("rb") as file:
+        await bot.send_document(
+            chat_id=channel_id,
+            document=InputFile(file, filename=filename),
+            caption=caption[:1024],
+        )
+    return True
+
+
+async def create_backup(query):
+    """Manual backup from Admin → Backup."""
+    if not DB_PATH.exists():
+        await query.message.reply_text("Database file does not exist.")
+        return
+
+    destination = None
+    try:
+        destination, filename, size = create_backup_file(query.from_user.id)
+
+        # Always give the owner the downloadable copy.
         with destination.open("rb") as file:
             await query.message.reply_document(
                 document=InputFile(file, filename=filename),
@@ -3043,67 +3269,229 @@ async def create_backup(query):
                 ),
             )
 
+        # If a backup channel is configured, keep an off-server copy too.
+        channel_id = backup_channel_id()
+        if channel_id:
+            try:
+                await send_backup_to_channel(
+                    query.get_bot(),
+                    destination,
+                    filename,
+                    size,
+                    automatic=False,
+                )
+                await query.message.reply_text(
+                    "☁️ A copy was also uploaded to the configured backup channel."
+                )
+            except Exception as channel_exc:
+                logger.exception("Manual backup channel upload failed")
+                db.log_error(
+                    "ERROR",
+                    "backup",
+                    "manual_channel_upload",
+                    repr(channel_exc),
+                )
+                await query.message.reply_text(
+                    "⚠️ Local/manual backup succeeded, but channel upload failed:\n"
+                    f"{clean_error(channel_exc)[:500]}"
+                )
+
     except Exception as exc:
         logger.exception("Backup creation failed")
         db.log_error("ERROR", "backup", "create", repr(exc))
         await query.message.reply_text(f"Backup failed:\n{clean_error(exc)[:700]}")
 
-    finally:
-        if source:
-            source.close()
-        if target:
-            target.close()
+
+async def automatic_backup_once(bot) -> bool:
+    """Create and upload one disaster-recovery backup."""
+    channel_id = backup_channel_id()
+    if not channel_id:
+        return False
+
+    destination = None
+    try:
+        destination, filename, size = create_backup_file(None)
+        await send_backup_to_channel(
+            bot,
+            destination,
+            filename,
+            size,
+            automatic=True,
+        )
+        db.log_event(
+            "automatic_backup_sent",
+            details=f"channel_id={channel_id};filename={filename};size={size}",
+        )
+        logger.info(
+            "Automatic backup uploaded: %s (%s bytes) -> %s",
+            filename,
+            size,
+            channel_id,
+        )
+        return True
+    except Exception as exc:
+        logger.exception("Automatic backup failed")
+        db.log_error("ERROR", "backup", "automatic", repr(exc))
+        return False
+
+
+async def automatic_backup_loop(application: Application):
+    """
+    Run forever in the bot process. Every minute, if a backup channel is
+    configured, create a complete SQLite snapshot and upload it there.
+    """
+    logger.info("Automatic backup worker started (interval=%ss).", AUTO_BACKUP_INTERVAL_SECONDS)
+
+    # Small startup delay avoids racing with startup DB/schema initialization.
+    await asyncio.sleep(5)
+
+    while True:
+        try:
+            await automatic_backup_once(application.bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.exception("Automatic backup loop iteration failed")
+            db.log_error("ERROR", "backup", "loop", repr(exc))
+
+        try:
+            await asyncio.sleep(AUTO_BACKUP_INTERVAL_SECONDS)
+        except asyncio.CancelledError:
+            logger.info("Automatic backup worker stopped.")
+            raise
+
+
+async def show_backup_channel(query):
+    channel_id = db.get_setting("backup_channel_id", "")
+    username = db.get_setting("backup_channel_username", "")
+    title = db.get_setting("backup_channel_title", "")
+    enabled = db.get_setting("backup_channel_enabled", "0") == "1"
+
+    if enabled and channel_id:
+        status_lines = [
+            "🟢 ENABLED",
+            f"Channel: {title or '-'}",
+            f"ID: {channel_id}",
+        ]
+        if username:
+            status_lines.append(f"Username: @{username}")
+        status = "\n".join(status_lines)
+    else:
+        status = "🔴 NOT CONFIGURED"
+
+    await query.edit_message_text(
+        "☁️ BACKUP CHANNEL\n\n"
+        f"{status}\n\n"
+        "Automatic backup: EVERY 1 MINUTE\n"
+        "Each backup is a complete SQLite database snapshot.\n"
+        "The file is uploaded to this Telegram channel so it survives "
+        "Render/local disk loss.\n\n"
+        "Bot requirements:\n"
+        "• Bot must be an administrator in the channel.\n"
+        "• Bot must have permission to post messages.\n"
+        "• Use a channel you control as the backup vault.",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [_make_callback_button("➕ Set / Change Channel", "set_backup_channel", "success")],
+                [_make_callback_button("⏸ Disable Auto Backup", "disable_backup_channel", "danger")],
+                [_make_callback_button("⬅️ Back", "admin_home", "primary")],
+            ]
+        ),
+    )
 
 
 async def restore_backup_from_document(message, context):
     """
-    Owner sends a .db backup file → validate and restore it.
-    The bot closes the current connection, overwrites the DB file,
-    and reconnects.
+    Owner sends a .db/.sqlite/.sqlite3 backup file -> validate -> restore.
+    Before replacement, make a local emergency snapshot of the current DB.
     """
     try:
         await message.reply_text("⏳ Validating backup file...")
 
         tg_file = await context.bot.get_file(message.document.file_id)
-        tmp_path = BACKUP_DIR / f"restore_tmp_{datetime.now().strftime('%Y%m%d%H%M%S')}.db"
+        suffix = Path(message.document.file_name or ".db").suffix.lower()
+        if suffix not in {".db", ".sqlite", ".sqlite3"}:
+            await message.reply_text(
+                "❌ Unsupported backup file. Send a .db, .sqlite or .sqlite3 file."
+            )
+            return
 
+        tmp_path = BACKUP_DIR / (
+            f"restore_tmp_{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S_%f')}.db"
+        )
         await tg_file.download_to_drive(str(tmp_path))
 
-        # Validate the uploaded file
+        # Validate the uploaded SQLite database.
         try:
             check_conn = sqlite3.connect(str(tmp_path), timeout=10)
             integrity = check_conn.execute("PRAGMA integrity_check").fetchone()[0]
             check_conn.close()
         except Exception as exc:
             tmp_path.unlink(missing_ok=True)
-            await message.reply_text(f"❌ Invalid backup file:\n{clean_error(exc)[:500]}")
+            await message.reply_text(
+                f"❌ Invalid backup file:\n{clean_error(exc)[:500]}"
+            )
             return
 
         if integrity != "ok":
             tmp_path.unlink(missing_ok=True)
-            await message.reply_text(f"❌ Backup integrity check failed: {integrity}")
+            await message.reply_text(
+                f"❌ Backup integrity check failed: {integrity}"
+            )
             return
 
-        # Close current DB connection
+        # Ensure this is a backup produced by this bot, or at minimum a valid
+        # SQLite DB containing the bot's core schema.
+        check_conn = sqlite3.connect(str(tmp_path), timeout=10)
+        tables = {
+            row[0]
+            for row in check_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        check_conn.close()
+
+        required_tables = {"users", "admins", "channels", "bot_settings", "messages"}
+        missing = required_tables - tables
+        if missing:
+            tmp_path.unlink(missing_ok=True)
+            await message.reply_text(
+                "❌ This is a valid SQLite file, but it is not a compatible bot backup.\n"
+                f"Missing tables: {', '.join(sorted(missing))}"
+            )
+            return
+
+        # Emergency snapshot of the currently running DB before overwrite.
+        emergency = None
+        try:
+            emergency, emergency_name, emergency_size = create_backup_file(message.from_user.id)
+            logger.info("Pre-restore emergency backup created: %s", emergency_name)
+        except Exception:
+            logger.exception("Could not create pre-restore emergency backup")
+
+        # Close current DB connection and atomically replace the live database.
         db.close()
-
-        # Copy the validated backup over the live DB
-        shutil.copy2(str(tmp_path), str(DB_PATH))
-        tmp_path.unlink(missing_ok=True)
-
-        # Reconnect
+        os.replace(str(tmp_path), str(DB_PATH))
         db.connect()
 
+        db.log_event(
+            "backup_restored",
+            user_id=message.from_user.id,
+            details=f"filename={message.document.file_name};pre_restore={bool(emergency)}",
+        )
+
         await message.reply_text(
-            "✅ Database restored successfully.\n\n"
-            "The bot is back online with the restored data.",
+            "✅ FULL BACKUP RESTORED SUCCESSFULLY.\n\n"
+            "All persisted users, settings, channels, messages, buttons, "
+            "join requests, broadcasts and logs from that backup are now active.\n\n"
+            "Automatic backup will continue using the restored backup-channel setting.",
             reply_markup=admin_menu(),
         )
 
     except Exception as exc:
         logger.exception("Backup restore failed")
         try:
-            db.connect()  # Make sure we're reconnected even on failure
+            db.connect()
         except Exception:
             pass
         await message.reply_text(f"❌ Restore failed:\n{clean_error(exc)[:700]}")
@@ -3220,6 +3608,13 @@ async def post_init(application: Application):
             details=f"bot_id={me.id};username={me.username}",
         )
 
+        # Start the disaster-recovery worker inside the same process. This does
+        # not require a paid Render Background Worker.
+        global AUTO_BACKUP_TASK
+        AUTO_BACKUP_TASK = application.create_task(
+            automatic_backup_loop(application)
+        )
+
         logger.info("Database initialized: %s", DB_PATH.resolve())
 
     except Exception:
@@ -3228,6 +3623,15 @@ async def post_init(application: Application):
 
 
 async def post_shutdown(application: Application):
+    global AUTO_BACKUP_TASK
+
+    if AUTO_BACKUP_TASK:
+        try:
+            AUTO_BACKUP_TASK.cancel()
+        except Exception:
+            pass
+        AUTO_BACKUP_TASK = None
+
     try:
         db.log_event("shutdown")
     except Exception:
