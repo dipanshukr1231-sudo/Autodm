@@ -1072,8 +1072,33 @@ def deserialize_message_entities(value: str, bot=None):
                 entity = MessageEntity(**kwargs)
             except TypeError:
                 # Older PTB builds may not accept newer optional fields.
+                # Keep custom_emoji_id whenever the installed PTB supports it.
                 kwargs.pop("date_time_format", None)
-                entity = MessageEntity(**kwargs)
+                try:
+                    entity = MessageEntity(**kwargs)
+                except TypeError:
+                    # Last compatibility fallback: construct with the fields
+                    # guaranteed by the Bot API, while never silently converting
+                    # a custom emoji entity into Unicode text.
+                    minimal = {
+                        "type": entity_type,
+                        "offset": offset,
+                        "length": length,
+                    }
+                    if entity_type == CUSTOM_EMOJI_ENTITY_TYPE and data.get("custom_emoji_id") is not None:
+                        minimal["custom_emoji_id"] = str(data["custom_emoji_id"])
+                    for key in ("url", "language"):
+                        if data.get(key) is not None:
+                            minimal[key] = data[key]
+                    entity = MessageEntity(**minimal)
+
+            # Custom emoji MUST retain its Telegram ID. If a malformed/legacy
+            # record has no ID, skip it instead of sending a fake Unicode emoji.
+            if entity_type == CUSTOM_EMOJI_ENTITY_TYPE:
+                custom_id = getattr(entity, "custom_emoji_id", None)
+                if not custom_id:
+                    logger.warning("Skipping custom_emoji entity without custom_emoji_id: %r", data)
+                    continue
 
             entities.append(entity)
         except Exception:
@@ -1157,31 +1182,26 @@ def render_template_with_entities(text: str, entities, user):
             continue
 
         try:
-            shifted.append(
-                MessageEntity(
-                    type=entity.type,
-                    offset=new_start,
-                    length=new_end - new_start,
-                    url=entity.url,
-                    user=entity.user,
-                    language=entity.language,
-                    custom_emoji_id=entity.custom_emoji_id,
-                    date_time_format=getattr(entity, "date_time_format", None),
-                    unix_time=getattr(entity, "unix_time", None),
-                )
-            )
-        except TypeError:
-            shifted.append(
-                MessageEntity(
-                    type=entity.type,
-                    offset=new_start,
-                    length=new_end - new_start,
-                    url=entity.url,
-                    user=entity.user,
-                    language=entity.language,
-                    custom_emoji_id=entity.custom_emoji_id,
-                )
-            )
+            entity_kwargs = {
+                "type": getattr(entity, "type", ""),
+                "offset": new_start,
+                "length": new_end - new_start,
+            }
+            # Only pass optional fields when they actually exist. This keeps
+            # template rendering compatible across PTB versions and, most
+            # importantly, preserves custom_emoji_id instead of dropping it.
+            for key in ("url", "user", "language", "custom_emoji_id", "date_time_format", "unix_time"):
+                value = getattr(entity, key, None)
+                if value is not None:
+                    entity_kwargs[key] = value
+            try:
+                shifted.append(MessageEntity(**entity_kwargs))
+            except TypeError:
+                entity_kwargs.pop("date_time_format", None)
+                entity_kwargs.pop("unix_time", None)
+                shifted.append(MessageEntity(**entity_kwargs))
+        except (TypeError, ValueError):
+            logger.warning("Could not shift message entity safely: %r", entity)
 
     return rendered, shifted
 
@@ -1208,6 +1228,17 @@ async def send_media_content(
     media_type = (media_type or "none").lower()
     caption = caption or ""
     entities = list(entities or [])
+
+    # Keep Telegram custom emoji as entities. Never replace a custom emoji
+    # with its visually similar Unicode character. Malformed legacy records
+    # are ignored so old databases remain usable without crashing delivery.
+    valid_entities = []
+    for entity in entities:
+        if getattr(entity, "type", None) == CUSTOM_EMOJI_ENTITY_TYPE and not getattr(entity, "custom_emoji_id", None):
+            logger.warning("Ignoring custom_emoji entity without custom_emoji_id during send")
+            continue
+        valid_entities.append(entity)
+    entities = valid_entities
 
     if media_type == "photo" and file_id:
         kwargs = {"chat_id": chat_id, "photo": file_id, "reply_markup": keyboard}
